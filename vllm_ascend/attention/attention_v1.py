@@ -105,6 +105,18 @@ class AscendAttentionBackend(AttentionBackend):
         # out unless they declare support themselves.
         return cls is AscendAttentionBackend
 
+    @classmethod
+    def uses_fia_v2(cls) -> bool:
+        """Whether this backend's updatable-graph FIA tasks call the v2 op.
+
+        The draft-model replay path merges per-layer dicts into the captured
+        task kwargs verbatim (SharedSource), so the key names must match the
+        op variant the backend registered: the v2 op takes TND-style
+        ``actual_seq_qlen``/``actual_seq_kvlen``, the v1 op takes
+        ``actual_seq_lengths``/``actual_seq_lengths_kv``.
+        """
+        return False
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,

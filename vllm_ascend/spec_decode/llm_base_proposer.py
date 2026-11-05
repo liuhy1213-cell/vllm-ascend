@@ -675,14 +675,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             )
                         )
                         continue
-                    update_params.append(
-                        {
-                            "layer_name": layer_name,
-                            "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                            "actual_seq_lengths_kv": metadata.seq_lens_list,
-                            "block_table": metadata.block_tables,
-                        }
-                    )
+                    # SharedSource merges these dicts into the captured task
+                    # kwargs verbatim, so the key names must match the FIA op
+                    # variant the draft backend registered (see
+                    # AscendAttentionBackend.uses_fia_v2).
+                    if att_backend.uses_fia_v2():
+                        update_params.append(
+                            {
+                                "layer_name": layer_name,
+                                "actual_seq_qlen": metadata.actual_seq_lengths_q,
+                                "actual_seq_kvlen": metadata.seq_lens_list,
+                                "block_table": metadata.block_tables,
+                            }
+                        )
+                    else:
+                        update_params.append(
+                            {
+                                "layer_name": layer_name,
+                                "actual_seq_lengths": metadata.actual_seq_lengths_q,
+                                "actual_seq_lengths_kv": metadata.seq_lens_list,
+                                "block_table": metadata.block_tables,
+                            }
+                        )
             self._runnable.update_draft_model_metadata(update_params)  # type: ignore
             self._runnable.set_attn_backend(att_backend)  # type: ignore
 

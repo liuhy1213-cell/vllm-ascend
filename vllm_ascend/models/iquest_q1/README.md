@@ -58,7 +58,6 @@ context parallelism remain unsupported).
 
 ## v0 scope / limitations
 
-- No MTP / speculative decoding (the checkpoint ships an `mtp/` recursive draft).
 - No quantization (bf16 only), no LoRA weights, no context parallelism.
 
 ## Running
@@ -77,6 +76,33 @@ vllm serve "$MODEL_ROOT" \
 ```
 
 Pass `--enforce-eager` to disable ACL graphs entirely (e.g., for debugging).
+
+### Recursive MTP speculative decoding (optional)
+
+The checkpoint ships a one-layer recursive draft as the `mtp/` subdirectory
+(`model_type: iquest_q1_mtp`, architecture `IQuestQ1MTP`). Add:
+
+```bash
+vllm serve "$MODEL_ROOT" ... \
+  --speculative-config '{"method":"eagle","model":"'"$MODEL_ROOT"'/mtp","num_speculative_tokens":5}'
+```
+
+- `num_speculative_tokens` must not exceed the checkpoint's trained
+  `num_draft_slots` (7); 5 is a validated depth. Serial drafting only
+  (`method='eagle'`; the target model rejects `method='mtp'`).
+- The draft reuses the target embedding and lm-head weights when they match,
+  so the extra memory is one draft layer plus its own KV cache group.
+- The draft runs the same Ascend sink-attention path and is wrapped in
+  `ACLGraphWrapper`, so speculative decoding works under the default
+  `FULL_DECODE_ONLY` graph mode too (verified on 950DT). Pass
+  `--enforce-eager` to disable ACL graphs entirely (e.g., for debugging).
+- ACL graph capture pools carve out device memory: at
+  `--gpu-memory-utilization 0.94` the KV budget shrinks to ~0.11 GiB
+  (~2.3k tokens) once the decode and draft graphs are captured. Raise the
+  utilization or lower `--max-num-seqs` when more concurrency is needed.
+- On Ascend the per-layer KV layout rescales the multi-group budget at
+  profiling time; prefer raising `--gpu-memory-utilization` over
+  `--kv-cache-memory` (the latter bypasses that rescaling and over-allocates).
 
 OpenAI-compatible smoke test:
 
@@ -105,5 +131,3 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 - `"sink" in name` in `worker/model_runner_v1.py` flips `_has_sinks` and sets
   `forward_context.sinks`. That flag is currently **not consumed** anywhere in
   vllm-ascend, so it should be inert — but worth re-checking if attention misbehaves.
-- ACL graph is not supported by design here; if vLLM tries to capture anyway,
-  the `NotImplementedError` in `forward_fused_infer_attention` will fire.

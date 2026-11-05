@@ -13,9 +13,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState, FIAV2ParamProvider
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, FIAV2ParamProvider
 from vllm_ascend.models.iquest_q1.attention import (
     SWA_INT_MAX,
+    IQuestQ1AscendAttentionBackend,
     IQuestQ1AscendAttentionImpl,
 )
 
@@ -164,3 +165,14 @@ def test_capture_uses_kv_cache_view_for_decode(recorded_task):
     assert kwargs["key"].shape == (num_blocks, block_size, kv_heads * head_dim)
     assert kwargs["key"].data_ptr() == impl.key_cache.data_ptr()
     assert kwargs["block_table"] is metadata.block_tables
+
+
+@pytest.mark.parametrize("backend,expected", [(IQuestQ1AscendAttentionBackend, True), (AscendAttentionBackend, False)])
+def test_uses_fia_v2_contract(backend, expected):
+    """The draft replay path keys its param dicts off this declaration.
+
+    The iquest sink path registers FIA v2 updatable tasks (TND key names);
+    the stock backend registers v1 tasks. A wrong declaration makes the
+    draft replay feed v1 key names into the v2 op (or vice versa).
+    """
+    assert backend.uses_fia_v2() is expected

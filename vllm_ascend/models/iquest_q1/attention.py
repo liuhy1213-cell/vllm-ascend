@@ -134,9 +134,11 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
             key = key.contiguous()
             value = value.contiguous()
 
+        # TND needs the true cumulative per-sequence query lengths. v0 decode was
+        # always 1 token/seq so a hardcoded cumsum([1]*n) matched by accident;
+        # with speculative decoding a decode step carries num_spec_tokens+1
+        # query tokens per sequence and the builder already provides them.
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
-        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            actual_seq_qlen = torch.tensor([1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
 
         sparse_mode = 4 if self.sliding_window is not None else 3
         attn_output, lse = torch_npu.npu_fused_infer_attention_score_v2(
@@ -286,6 +288,13 @@ class IQuestQ1AscendAttentionBackend(AscendAttentionBackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return False
+
+    @classmethod
+    def uses_fia_v2(cls) -> bool:
+        # The sink path registers FIA v2 updatable tasks (see
+        # forward_fused_infer_attention_capturing), so the draft replay
+        # must feed TND-style param key names.
+        return True
 
 
 class IQuestQ1AscendAttention(Attention):
