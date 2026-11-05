@@ -69,7 +69,11 @@ class IQuestQ1Config(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.mlp_only_layers = [0] if mlp_only_layers is None else list(mlp_only_layers)
         self.use_hybrid_layers = use_hybrid_layers
-        self.first_layers_types = ["full_attention"] if first_layers_types is None else list(first_layers_types)
+        self.first_layers_types = (
+            ["full_attention"]
+            if first_layers_types is None
+            else list(first_layers_types)
+        )
         self.hybrid_layers_types_block = (
             [
                 "full_attention",
@@ -81,7 +85,11 @@ class IQuestQ1Config(PretrainedConfig):
             else list(hybrid_layers_types_block)
         )
         self.num_hybrid_layers_block = num_hybrid_layers_block
-        self.last_layers_types = ["full_attention"] * 3 if last_layers_types is None else list(last_layers_types)
+        self.last_layers_types = (
+            ["full_attention"] * 3
+            if last_layers_types is None
+            else list(last_layers_types)
+        )
         self.use_sliding_window = use_sliding_window
         self.sliding_window = sliding_window if use_sliding_window else None
         if use_hybrid_layers:
@@ -92,10 +100,15 @@ class IQuestQ1Config(PretrainedConfig):
             )
             if len(layer_types) != num_hidden_layers:
                 raise ValueError(
-                    f"IQuestQ1 hybrid layer pattern has {len(layer_types)} layers, expected {num_hidden_layers}"
+                    "IQuestQ1 hybrid layer pattern has "
+                    f"{len(layer_types)} layers, expected {num_hidden_layers}"
                 )
-            if any(t not in ("full_attention", "sliding_attention") for t in layer_types):
-                raise ValueError("IQuestQ1 supports full_attention and sliding_attention layers")
+            if any(
+                t not in ("full_attention", "sliding_attention") for t in layer_types
+            ):
+                raise ValueError(
+                    "IQuestQ1 supports full_attention and sliding_attention layers"
+                )
         else:
             layer_types = ["full_attention"] * num_hidden_layers
         if not use_sliding_window:
@@ -109,7 +122,9 @@ class IQuestQ1Config(PretrainedConfig):
         self.rope_parameters.setdefault("rope_theta", rope_theta)
         if rotary_dim is not None:
             if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
-                raise ValueError("rotary_dim must be even, positive, and at most head_dim")
+                raise ValueError(
+                    "rotary_dim must be even, positive, and at most head_dim"
+                )
             self.rope_parameters["partial_rotary_factor"] = rotary_dim / head_dim
         self.no_rope_layers = list(no_rope_layers or [])
         self.enable_sink_attention = enable_sink_attention
@@ -176,7 +191,9 @@ class IQuestQ1MTPConfig(IQuestQ1Config):
             use_hybrid_layers=True,
             use_sliding_window=window is not None,
             sliding_window=window,
-            first_layers_types=["sliding_attention" if window is not None else "full_attention"],
+            first_layers_types=[
+                "sliding_attention" if window is not None else "full_attention"
+            ],
             hybrid_layers_types_block=[],
             num_hybrid_layers_block=0,
             last_layers_types=[],

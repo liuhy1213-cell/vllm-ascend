@@ -24,7 +24,8 @@ plus its backend in ``attention.py``, which folds in the learned sink key using
 the softmax LSE returned by ``npu_fused_infer_attention_score_v2``.
 
 v0 scope: no MTP / speculative decoding, no quantization.
-Run with ``--enforce-eager`` (the sink path is not ACL-graph compatible yet).
+ACL graph mode is supported for decode (``cudagraph_mode`` FULL / FULL_DECODE_ONLY);
+prefill runs eagerly.
 """
 
 from collections.abc import Iterable
@@ -32,6 +33,7 @@ from itertools import islice
 
 import torch
 from torch import nn
+
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.model import str_dtype_to_torch_dtype
@@ -92,13 +94,17 @@ def get_layer_sliding_window_size(
         return None
 
     num_first_layers = len(first_layers_types)
-    num_hybrid_block_layers = len(hybrid_layers_types_block) * num_hybrid_layers_types_block
+    num_hybrid_block_layers = (
+        len(hybrid_layers_types_block) * num_hybrid_layers_types_block
+    )
 
     if layer_idx < num_first_layers:
         current_layer_type = first_layers_types[layer_idx]
     elif layer_idx < num_first_layers + num_hybrid_block_layers:
         effective_layer_idx = layer_idx - num_first_layers
-        current_layer_type = hybrid_layers_types_block[effective_layer_idx % len(hybrid_layers_types_block)]
+        current_layer_type = hybrid_layers_types_block[
+            effective_layer_idx % len(hybrid_layers_types_block)
+        ]
     else:
         effective_layer_idx = layer_idx - num_first_layers - num_hybrid_block_layers
         current_layer_type = last_layers_types[effective_layer_idx]
@@ -176,7 +182,9 @@ class IQuestQ1MoEBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
         return final_hidden_states.view(orig_shape)
 
 
@@ -207,7 +215,9 @@ class IQuestQ1DenseMLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported."
+            )
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -361,7 +371,9 @@ class IQuestQ1Attention(nn.Module):
         if self.enable_sink_attention:
             from .attention import IQuestQ1AscendAttention
 
-            self.sink_k = nn.Parameter(torch.zeros(self.num_kv_heads, self.head_dim), requires_grad=False)
+            self.sink_k = nn.Parameter(
+                torch.zeros(self.num_kv_heads, self.head_dim), requires_grad=False
+            )
             set_weight_attrs(self.sink_k, {"weight_loader": self.sinks_k_weight_loader})
             attn_cls = IQuestQ1AscendAttention
             sink_args["sink_key"] = self.sink_k
@@ -404,7 +416,9 @@ class IQuestQ1Attention(nn.Module):
                 q, _ = self.rotary_emb(positions, q, None)
             attn_output = self.attn(q, None, None)
         else:
-            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+            )
             assert self.k_norm is not None
             k_by_head = self.k_norm(k_by_head)
             k = k_by_head.view(k.shape)
@@ -456,11 +470,19 @@ class IQuestQ1DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.attention_norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn_out_norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.feed_forward_norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_norm = IQuestQ1RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.attn_out_norm = IQuestQ1RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.feed_forward_norm = IQuestQ1RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         if self.use_sandwich_norm:
-            self.ffn_out_norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.ffn_out_norm = IQuestQ1RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
         if self.layer_idx == 0:
             self.attn_out_scale = getattr(config, "first_layer_attn_out_scale", 1.0)
@@ -477,7 +499,9 @@ class IQuestQ1DecoderLayer(nn.Module):
         # Self Attention
         if self.use_sandwich_norm:
             norm_hidden_states = self.attention_norm(hidden_states)
-            attn_output = self.self_attn(positions=positions, hidden_states=norm_hidden_states)
+            attn_output = self.self_attn(
+                positions=positions, hidden_states=norm_hidden_states
+            )
             h = hidden_states + self.attn_out_norm(attn_output) * self.attn_out_scale
 
             # fully connected
@@ -510,7 +534,9 @@ class IQuestQ1Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.config = config
-        if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
+        if get_pp_group().is_first_rank or (
+            config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -533,10 +559,14 @@ class IQuestQ1Model(nn.Module):
 
         self.use_oe_embedding = getattr(config, "use_over_encoding", False)
         if self.use_oe_embedding:
-            raise NotImplementedError("IQuestQ1 over-encoding embeddings are not supported")
+            raise NotImplementedError(
+                "IQuestQ1 over-encoding embeddings are not supported"
+            )
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
 
-    def embed_input_ids(self, input_ids: torch.Tensor, oe_input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, oe_input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -552,7 +582,9 @@ class IQuestQ1Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 assert input_ids is not None
-                hidden_states = self.embed_input_ids(input_ids, oe_input_ids=oe_input_ids)
+                hidden_states = self.embed_input_ids(
+                    input_ids, oe_input_ids=oe_input_ids
+                )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -648,14 +680,18 @@ class IQuestQ1Model(nn.Module):
 
                     if "experts.fc" in name:
                         # Shape: [experts, 2 * intermediate_size, hidden_size].
-                        name = name.replace("experts.fc", "experts.routed_experts.w13_weight")
+                        name = name.replace(
+                            "experts.fc", "experts.routed_experts.w13_weight"
+                        )
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         for expert_id in range(self.config.num_experts):
                             # w1 shard
                             weight_loader(
                                 param,
-                                loaded_weight[expert_id][: self.config.intermediate_size],
+                                loaded_weight[expert_id][
+                                    : self.config.intermediate_size
+                                ],
                                 name,
                                 shard_id="w1",
                                 expert_id=expert_id,
@@ -663,7 +699,9 @@ class IQuestQ1Model(nn.Module):
                             # w3 shard
                             weight_loader(
                                 param,
-                                loaded_weight[expert_id][self.config.intermediate_size :],
+                                loaded_weight[expert_id][
+                                    self.config.intermediate_size :
+                                ],
                                 name,
                                 shard_id="w3",
                                 expert_id=expert_id,
@@ -677,7 +715,9 @@ class IQuestQ1Model(nn.Module):
 
                     if "experts.proj" in name:
                         # Shape: [experts, hidden_size, intermediate_size].
-                        name = name.replace("experts.proj", "experts.routed_experts.w2_weight")
+                        name = name.replace(
+                            "experts.proj", "experts.routed_experts.w2_weight"
+                        )
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         for expert_id in range(self.config.num_experts):
@@ -699,7 +739,9 @@ class IQuestQ1Model(nn.Module):
                         continue
                     # Remapping the name of FP8 kv-scale.
                     if name.endswith("kv_scale"):
-                        remapped_kv_scale_name = name.replace(".kv_scale", ".attn.kv_scale")
+                        remapped_kv_scale_name = name.replace(
+                            ".kv_scale", ".attn.kv_scale"
+                        )
                         if remapped_kv_scale_name not in params_dict:
                             logger.warning_once(
                                 "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",  # noqa: E501
@@ -714,7 +756,9 @@ class IQuestQ1Model(nn.Module):
                         name = name.replace("router.weight", "gate.weight")
 
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -741,7 +785,9 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         super().__init__()
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None and speculative_config.method == "mtp":
-            raise ValueError("IQuestQ1 requires method='eagle' with a standalone recursive draft")
+            raise ValueError(
+                "IQuestQ1 requires method='eagle' with a standalone recursive draft"
+            )
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
@@ -763,11 +809,17 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 )
         else:
             self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size, scale=getattr(config, "logit_scale", 1.0))
-        self.logits_processor.head_dtype = (
-            torch.float32 if config.enable_lm_head_fp32 else vllm_config.model_config.dtype
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size, scale=getattr(config, "logit_scale", 1.0)
         )
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.logits_processor.head_dtype = (
+            torch.float32
+            if config.enable_lm_head_fp32
+            else vllm_config.model_config.dtype
+        )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
