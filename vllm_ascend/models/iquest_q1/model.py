@@ -24,7 +24,8 @@ plus its backend in ``attention.py``, which folds in the learned sink key using
 the softmax LSE returned by ``npu_fused_infer_attention_score_v2``.
 
 v0 scope: no MTP / speculative decoding, no quantization.
-Run with ``--enforce-eager`` (the sink path is not ACL-graph compatible yet).
+ACL graph mode is supported for decode (``cudagraph_mode`` FULL / FULL_DECODE_ONLY);
+prefill runs eagerly.
 """
 
 from collections.abc import Iterable

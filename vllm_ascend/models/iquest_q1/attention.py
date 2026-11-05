@@ -29,23 +29,31 @@ The CANN FIA operand ``learnable_sink`` only accepts a per-query-head *constant*
 ``npu_fused_infer_attention_score_v2`` for the real softmax LSE
 (``return_softmax_lse=True``) and apply the sink correction with plain torch ops.
 
-v0 scope (correctness first): eager only, no ACL graph capture, no ACL graph /
-chunked-prefill phase split, no context parallelism.
+ACL graph mode: decode (and any other captured state) goes through the
+vllm-ascend ``UpdatableGraph`` mechanism.  The FIA v2 call is registered as an
+*updatable task* whose host-side sequence-length parameters are re-resolved
+from the live attention metadata before every replay, and the sink correction
+is captured as regular graph ops on the task's output buffers.  The LSE is
+requested explicitly (``return_softmax_lse=True``) because the ``.out`` variant
+only fills the LSE buffer when the flag is set.  Chunked-prefill phase split
+and context parallelism remain unsupported.
 """
 
 import torch
 import torch_npu
-
 from vllm.model_executor.layers.attention import Attention
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
+    _FIA_V2_WORKSPACE_KEY,
     SWA_INT_MAX,
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
+    FIAV2ParamProvider,
 )
+from vllm_ascend.compilation.updatable_graph import get_capture_resource, register_task
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     attention_transfer_window,
 )
@@ -112,10 +120,7 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
         kv_cache=None,
     ):
         if _EXTRA_CTX.capturing:
-            raise NotImplementedError(
-                "IQuest-Q1 learned-key sink attention v0 does not support ACL graph "
-                "capture. Please run with --enforce-eager."
-            )
+            return self.forward_fused_infer_attention_capturing(query, key, value, attn_metadata, output, kv_cache)
 
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
@@ -131,9 +136,7 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
 
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            actual_seq_qlen = torch.tensor(
-                [1] * len(attn_metadata.seq_lens_list), dtype=torch.int32
-            ).cumsum(dim=0)
+            actual_seq_qlen = torch.tensor([1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
 
         sparse_mode = 4 if self.sliding_window is not None else 3
         attn_output, lse = torch_npu.npu_fused_infer_attention_score_v2(
@@ -157,6 +160,75 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         self._apply_sink_key(query, attn_output, lse, num_tokens)
         output[:num_tokens] = attn_output[:num_tokens]
+        return output
+
+    def forward_fused_infer_attention_capturing(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+        kv_cache=None,
+    ):
+        """FIA v2 + sink correction expressed as an updatable-graph task.
+
+        Unlike the eager path, the op is not called directly: it is registered
+        as an updatable task of the ACL graph being captured, so the host-side
+        sequence-length parameters are re-resolved from the live attention
+        metadata before every replay. Device buffers (query, KV cache, output,
+        LSE) keep their capture-time addresses, which the model runner
+        guarantees through its persistent input buffers.
+
+        The sink correction is captured as regular graph ops reading the task's
+        output buffers, so it re-runs on the freshly updated FIA output and LSE
+        at every replay.
+        """
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
+            key, value, attn_metadata, kv_cache
+        )
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            key = key[:num_tokens]
+            value = value[:num_tokens]
+        key = key.contiguous()
+        value = value.contiguous()
+
+        has_sliding_window = self.sliding_window is not None
+        fia_kwargs = {
+            "query": query,
+            "key": key,
+            "value": value,
+            "atten_mask": attn_metadata.attn_mask,
+            "block_table": block_table,
+            "input_layout": "TND",
+            "block_size": block_size,
+            "actual_seq_qlen": attn_metadata.actual_seq_lengths_q,
+            "actual_seq_kvlen": actual_seq_lengths_kv,
+            "num_key_value_heads": self.num_kv_heads,
+            "num_query_heads": self.num_heads,
+            "sparse_mode": 4 if has_sliding_window else 3,
+            "pre_tokens": self.sliding_window if has_sliding_window else SWA_INT_MAX,
+            "next_tokens": 0,
+            "softmax_scale": self.scale,
+            # The .out variant only fills the LSE buffer when this is set.
+            "return_softmax_lse": True,
+        }
+        workspace = get_capture_resource(
+            _FIA_V2_WORKSPACE_KEY,
+            lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**fia_kwargs),
+            self._use_max_workspace_for_fia_graph,
+        )
+        # The LSE is a genuine fp32 (T, Q_N, 1) output here, so the buffer must
+        # be a graph-pool tensor whose address stays stable across replays.
+        lse = torch.empty((num_tokens, self.num_heads, 1), dtype=torch.float32, device=query.device)
+        register_task(
+            torch_npu.npu_fused_infer_attention_score_v2.out,
+            {**fia_kwargs, "workspace": workspace, "out": [output[:num_tokens], lse]},
+            FIAV2ParamProvider(self._layer_name),
+        )
+        self._apply_sink_key(query, output[:num_tokens], lse, num_tokens)
         return output
 
     def _apply_sink_key(
@@ -223,9 +295,7 @@ class IQuestQ1AscendAttention(Attention):
         kwargs["attn_backend"] = IQuestQ1AscendAttentionBackend
         super().__init__(*args, **kwargs)
         if self.head_size_v != self.head_size:
-            raise NotImplementedError(
-                "IQuest-Q1 learned sinks require equal query, key and value head sizes"
-            )
+            raise NotImplementedError("IQuest-Q1 learned sinks require equal query, key and value head sizes")
         if tuple(sink_key.shape) != (self.num_kv_heads, self.head_size):
             raise ValueError(
                 "IQuest-Q1 sink key must have shape "
