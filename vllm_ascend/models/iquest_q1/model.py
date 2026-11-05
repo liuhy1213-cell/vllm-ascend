@@ -391,6 +391,17 @@ class IQuestQ1Attention(nn.Module):
             prefix=f"{prefix}.attn",
             **sink_args,
         )
+        if is_mtp_layer and real_sliding_window is not None:
+            # The draft checkpoint runs a trained sliding window, but only in
+            # the kernel: the attention impl captured the window at build time
+            # above, so its FIA calls keep sparse_mode=4/pre_tokens. The
+            # KV-cache spec must stay full-attention though: under
+            # --disable-hybrid-kv-cache-manager (required by the Mooncake PD
+            # connector) every layer merges into one group, and
+            # FullAttentionSpec.merge rejects a second distinct window value
+            # next to the target's promoted SWA window. Allocation is full
+            # either way; clearing the module attr only changes the spec view.
+            self.attn.sliding_window = None
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         replicas = max(1, self.tp_size // self.total_num_kv_heads)
