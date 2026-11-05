@@ -6,13 +6,30 @@ def register_model():
     # registered with transformers before ModelConfig can build an HF config.
     from transformers import AutoConfig
 
-    from vllm_ascend.models.iquest_q1.configs import IQuestQ1Config
+    from vllm_ascend.models.iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPConfig
 
     AutoConfig.register(IQuestQ1Config.model_type, IQuestQ1Config, exist_ok=True)
+    AutoConfig.register(IQuestQ1MTPConfig.model_type, IQuestQ1MTPConfig, exist_ok=True)
     ModelRegistry.register_model(
         "IQuestQ1ForCausalLM",
         "vllm_ascend.models.iquest_q1.model:IQuestQ1ForCausalLM",
     )
+    # The recursive MTP draft head is ported from the upstream plugin
+    # `IQuestLab/vllm-iquest-q1` as well; the checkpoint ships as the `mtp/`
+    # subdirectory of the target model and declares `IQuestQ1MTP`, so all
+    # plugin aliases map onto the same lazy class.
+    for architecture in (
+        "IQuestQ1MTP",
+        "EagleIQuestQ1MTP",
+        "IQuestQ1MtpRecursive",
+        "IQuestQ1MTPRecursive",
+        "EagleIQuestQ1MtpRecursive",
+        "EagleIQuestQ1MTPRecursive",
+    ):
+        ModelRegistry.register_model(
+            architecture,
+            "vllm_ascend.models.iquest_q1.mtp_recursive:IQuestQ1MTPRecursive",
+        )
     # The `iquest_q1` reasoning / tool parsers are ported from the upstream
     # plugin `IQuestLab/vllm-iquest-q1`; registered lazily like the model.
     from vllm.reasoning import ReasoningParserManager
