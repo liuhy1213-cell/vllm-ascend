@@ -755,6 +755,30 @@ class IQuestQ1Model(nn.Module):
                     if "router.weight" in name:
                         name = name.replace("router.weight", "gate.weight")
 
+                    # ModelSlim KV-recipe tensors reuse the FAKQuant key names
+                    # (fa_v.scale etc., e.g. the static V-cache scale of the
+                    # MXFP8 C8 recipe). With a float KV cache they have no
+                    # parameter to land on, and AutoWeightsLoader's
+                    # ignore_unexpected_suffixes never sees this custom
+                    # loader — drop them here instead. Serving with the
+                    # recipe enabled (--kv-cache-dtype mxfp8) remaps them
+                    # upstream via get_cache_scale_mapper.
+                    if name not in params_dict and name.endswith(
+                        (
+                            ".fa_v.scale",
+                            ".fa_v.offset",
+                            ".fa_q.scale",
+                            ".fa_q.offset",
+                            ".fa_k.scale",
+                            ".fa_k.offset",
+                        )
+                    ):
+                        logger.warning_once(
+                            "Skipping ModelSlim KV-recipe tensor %s: it has no "
+                            "consumer without KV cache quantization.", name
+                        )
+                        continue
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
