@@ -807,7 +807,15 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             "q_proj",
             "k_proj",
             "v_proj",
-        ]
+        ],
+        # ModelSlim quant descriptions key the dense/shared MLP shards
+        # individually (mlp.gate_proj / mlp.up_proj); without this entry the
+        # fused gate_up_proj resolves to an unquantized module and the fp8
+        # weight is silently downcast while its scale hits a KeyError.
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
     }
 
     def __init__(
