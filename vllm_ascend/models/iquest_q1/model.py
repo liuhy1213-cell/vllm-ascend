@@ -730,6 +730,43 @@ class IQuestQ1Model(nn.Module):
                         loaded_params.add(name)
                         continue
 
+                    # vLLM-native packed expert layout produced by
+                    # modelslim_convert + repack_experts.py (MXFP8).
+                    if (
+                        "experts.routed_experts.w13_weight" in name
+                        or "experts.routed_experts.w2_weight" in name
+                    ):
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        if "w13_weight" in name:
+                            for expert_id in range(self.config.num_experts):
+                                expert = loaded_weight[expert_id]
+                                weight_loader(
+                                    param,
+                                    expert[: self.config.intermediate_size],
+                                    name,
+                                    shard_id="w1",
+                                    expert_id=expert_id,
+                                )
+                                weight_loader(
+                                    param,
+                                    expert[self.config.intermediate_size :],
+                                    name,
+                                    shard_id="w3",
+                                    expert_id=expert_id,
+                                )
+                        else:
+                            for expert_id in range(self.config.num_experts):
+                                weight_loader(
+                                    param,
+                                    loaded_weight[expert_id],
+                                    name,
+                                    shard_id="w2",
+                                    expert_id=expert_id,
+                                )
+                        loaded_params.add(name)
+                        continue
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -771,7 +808,11 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             "q_proj",
             "k_proj",
             "v_proj",
-        ]
+        ],
+        # 稠密 MLP（layer 0）在模型里是 MergedColumnParallelLinear，
+        # 权重文件里是 gate_proj/up_proj 两个分片。不声明分片映射，
+        # modelslim quant config 无法确定该层量化类型，weight_scale 不会被创建。
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(
