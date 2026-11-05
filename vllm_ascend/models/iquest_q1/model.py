@@ -678,7 +678,15 @@ class IQuestQ1Model(nn.Module):
                         logger.warning_once("sink attention feature is disabled")
                         continue
 
-                    if "experts.fc" in name:
+                    # ModelSlim quantized checkpoints already name the fused
+                    # expert tensors routed_experts.{w13,w2}_weight[_scale]
+                    # (the fp8 weight plus its E8M0 group scale share the
+                    # same [experts, ...] layout), while bf16 checkpoints
+                    # store them as experts.fc / experts.proj.
+                    if (
+                        "experts.fc" in name
+                        or "experts.routed_experts.w13_weight" in name
+                    ):
                         # Shape: [experts, 2 * intermediate_size, hidden_size].
                         name = name.replace(
                             "experts.fc", "experts.routed_experts.w13_weight"
@@ -713,7 +721,10 @@ class IQuestQ1Model(nn.Module):
                         logger.warning_once("over encoding feature is disabled")
                         continue
 
-                    if "experts.proj" in name:
+                    if (
+                        "experts.proj" in name
+                        or "experts.routed_experts.w2_weight" in name
+                    ):
                         # Shape: [experts, hidden_size, intermediate_size].
                         name = name.replace(
                             "experts.proj", "experts.routed_experts.w2_weight"
