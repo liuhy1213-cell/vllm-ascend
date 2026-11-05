@@ -1795,13 +1795,54 @@ class MooncakeConnectorWorker:
                 if isinstance(kv_cache_tuple, (list, tuple)) is False:
                     kv_cache_tuple = [kv_cache_tuple]
                 tensors = sorted(kv_cache_tuple, key=lambda t: t.data_ptr())
-                span_base = min(t.data_ptr() for t in tensors)
-                span_end = max(t.data_ptr() + t.numel() * t.element_size() for t in tensors)
-                span = span_end - span_base
-                tensors_bytes = sum(t.numel() * t.element_size() for t in tensors)
-                if len(tensors) == 1 or span >= tensors_bytes:
-                    # Disjoint contiguous allocations (e.g. MLA's single fused
-                    # cache per layer): register each tensor as its own region.
+                if len(tensors) == 1:
+                    single_kv_cache = tensors[0]
+                    tensor_num_blocks = single_kv_cache.shape[0]
+                    block_size_scale = tensor_num_blocks // self.num_blocks
+                    block_shape = single_kv_cache.shape[1:]
+                    self.block_len_per_addr.append(
+                        single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
+                    )
+                    self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
+                    ptrs.append(single_kv_cache.data_ptr())
+                    lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
+                    continue
+                first, second = tensors
+                k_page = first.element_size() * math.prod(first.shape[1:])
+                page_len = 2 * k_page
+                interleave_stride = first.stride(0) * first.element_size()
+                if (
+                    second.data_ptr() - first.data_ptr() == k_page
+                    and interleave_stride == page_len
+                    and second.stride(0) == first.stride(0)
+                ):
+                    # K/V are strided views of one [blocks, 2, tokens, h, d]
+                    # buffer (V sits one K-page into it): the views overlap
+                    # and the transfer engine rejects overlapping regions.
+                    # Register the covering span once instead — a page is the
+                    # contiguous [K_b | V_b] slice, so base + block_id *
+                    # page_len addresses exactly the bytes the per-view math
+                    # would, on both the producer and the consumer side.
+                    span = page_len * first.shape[0]
+                    if span % self.num_blocks != 0:
+                        raise ValueError(
+                            f"Interleaved KV span for {layer_name} ({span} B) is not "
+                            f"divisible by num_blocks ({self.num_blocks})."
+                        )
+                    logger.info(
+                        "Registering interleaved KV span for %s: base=0x%x page=%d B x %d blocks",
+                        layer_name,
+                        first.data_ptr(),
+                        page_len,
+                        first.shape[0],
+                    )
+                    self.kv_caches_base_addr.append(first.data_ptr())
+                    self.block_len_per_addr.append(page_len)
+                    ptrs.append(first.data_ptr())
+                    lengths.append(span)
+                else:
+                    # Disjoint contiguous allocations: register each tensor
+                    # as its own region (original behavior).
                     for single_kv_cache in tensors:
                         tensor_num_blocks = single_kv_cache.shape[0]
                         block_size_scale = tensor_num_blocks // self.num_blocks
@@ -1812,44 +1853,6 @@ class MooncakeConnectorWorker:
                         self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
                         ptrs.append(single_kv_cache.data_ptr())
                         lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
-                    continue
-                # Interleaved K/V views of one [blocks, tokens, 2, h, d]
-                # buffer: the views overlap (V starts one K-page into the
-                # buffer) and the transfer engine rejects overlapping
-                # regions. Register the covering span once instead — a page
-                # is the contiguous [K_b | V_b] slice, so base + block_id *
-                # page_len addresses exactly the bytes the per-view math
-                # would, on both the producer and the consumer side.
-                if len(tensors) != 2:
-                    raise ValueError(
-                        f"Mooncake connector supports 1 (fused) or 2 (K/V) kv "
-                        f"tensors per layer, got {len(tensors)} for {layer_name}."
-                    )
-                if span % self.num_blocks != 0:
-                    raise ValueError(
-                        f"Interleaved KV span for {layer_name} ({span} B) is not "
-                        f"divisible by num_blocks ({self.num_blocks})."
-                    )
-                first, _second = tensors
-                k_page = first.element_size() * math.prod(first.shape[1:])
-                if (_second.data_ptr() - first.data_ptr()) != k_page:
-                    raise ValueError(
-                        f"Unexpected K/V interleave stride for {layer_name}: "
-                        f"V-K ptr delta {_second.data_ptr() - first.data_ptr()} "
-                        f"!= per-block K bytes {k_page}."
-                    )
-                page_len = span // self.num_blocks
-                logger.info(
-                    "Registering interleaved KV span for %s: base=0x%x page=%d B x %d blocks",
-                    layer_name,
-                    span_base,
-                    page_len,
-                    self.num_blocks,
-                )
-                self.kv_caches_base_addr.append(span_base)
-                self.block_len_per_addr.append(page_len)
-                ptrs.append(span_base)
-                lengths.append(span)
         elif self.use_mamba:
             for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
                 for layer_name in get_kv_cache_tensor_layers(kv_cache_tensor):
