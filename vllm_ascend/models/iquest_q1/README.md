@@ -34,12 +34,30 @@ and apply the correction with plain torch ops (see `_apply_sink_key`).
 No custom Ascend kernel is needed at this stage. A Triton-ascend fusion of
 `q·sink_k → exp → div` is the obvious next optimization.
 
+## ACL graph mode
+
+Decode supports ACL graph capture (`--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`,
+or `FULL`). The FIA v2 call is registered as an **updatable task**
+(`vllm_ascend/compilation/updatable_graph.py`): during capture the op is
+recorded inside a task group, and before every replay its host-side
+`actual_seq_qlen` / `actual_seq_kvlen` are re-resolved from the live attention
+metadata and the task node is refreshed (`graph_task_update`). The sink
+correction is captured as ordinary graph ops that read the task's output
+buffers (attention output + a fp32 `(T, Q_N, 1)` LSE buffer), so it re-runs on
+updated FIA results each replay.
+
+Two details that matter:
+- the `.out` variant only fills the LSE buffer when `return_softmax_lse=True`
+  is passed explicitly (verified on 950DT: without the flag the buffer keeps
+  stale contents);
+- the LSE returned by `return_softmax_lse=True` is **fp32**, not the query
+  dtype.
+
+Prefill runs eagerly under `FULL_DECODE_ONLY` (chunked-prefill phase split and
+context parallelism remain unsupported).
+
 ## v0 scope / limitations
 
-- **Eager only.** The sink path is not ACL-graph compatible; the impl raises
-  `NotImplementedError` when `_EXTRA_CTX.capturing`. **Always pass `--enforce-eager`.**
-- The paged-attention decode path is bypassed (it cannot return the LSE), so every
-  layer goes through FIA. Expect decode to be slower than a native GQA model.
 - No MTP / speculative decoding (the checkpoint ships an `mtp/` recursive draft).
 - No quantization (bf16 only), no LoRA weights, no context parallelism.
 
@@ -51,12 +69,14 @@ MODEL_ROOT=/path/to/IQuest-Q1
 vllm serve "$MODEL_ROOT" \
   --served-model-name IQuest-Q1 \
   --tensor-parallel-size 8 \
-  --enforce-eager \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --reasoning-parser iquest_q1 \
   --enable-auto-tool-choice \
   --tool-call-parser iquest_q1 \
   --max-model-len 8192        # start small; 512K needs real KV budget planning
 ```
+
+Pass `--enforce-eager` to disable ACL graphs entirely (e.g., for debugging).
 
 OpenAI-compatible smoke test:
 
