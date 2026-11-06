@@ -808,10 +808,22 @@ class AscendModelSlimConfig(QuantizationConfig):
         layers. Other AttentionLayerBase subclasses (GDN/Mamba, encoder
         attention, ...) must not get the MXFP KV-cache method: they have no
         ``num_kv_heads``/``head_size_v`` and install the QFA backend on the
-        wrong layer type."""
+        wrong layer type.
+
+        Per-layer sliding-window ``Attention`` layers are excluded as well:
+        the C8-MXFP QFA path raises NotImplementedError for sliding-window
+        attention (AscendC8MXFPAttentionBackendImpl), and their
+        SlidingWindowSpec would neither be converted by ``mxfp_cache_spec``
+        nor receive the (k, v, k_scale, v_scale) cache tuple -- the mismatch
+        crashes ``_fill_c8_mxfp_v_scale_caches`` (``cache[3]`` on a raw K/V
+        tuple). Those layers keep their unquantized KV cache instead.
+        """
         from vllm.model_executor.layers.attention import Attention
 
-        return isinstance(layer, Attention)
+        return (
+            isinstance(layer, Attention)
+            and getattr(layer, "sliding_window", None) is None
+        )
 
     @property
     def enable_mxfp_c8_quant(self) -> bool:
