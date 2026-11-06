@@ -32,6 +32,7 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
+import torch_npu
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -116,7 +117,14 @@ def get_layer_sliding_window_size(
 
 
 class IQuestQ1RMSNorm(nn.Module):
-    """RMSNorm (equivalent to T5LayerNorm)."""
+    """RMSNorm (equivalent to T5LayerNorm) backed by the fused Ascend op.
+
+    The reference implementation is a plain torch chain
+    (``to(fp32) -> pow -> mean -> rsqrt -> mul -> to(dtype)``); on NPU that
+    costs 5-7 kernels plus two fp32 copies per invocation, and this module is
+    called ~5 times per layer (~440 times per token). ``torch_npu.npu_rms_norm``
+    does the same math (fp32 accumulation) in a single kernel.
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -124,12 +132,24 @@ class IQuestQ1RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        result = (self.weight * hidden_states).to(input_dtype)
-        return result
+        # npu_rms_norm keeps the fp32 normalization internally and accepts a
+        # bf16/fp32 gamma with bf16 input (Ascend 950). The eps add, rsqrt and
+        # gamma multiply are fused into the same kernel.
+        #
+        # The aclnn op only accepts ND (contiguous) tensors: q/k norms are
+        # applied to per-head views of the fused QKV projection, whose row
+        # stride still spans the full projection. Materialize a contiguous
+        # copy for those; the hidden-size norms are already contiguous.
+        # aclnnRmsNorm only accepts ND (contiguous) tensors and the
+        # (x, gamma) dtypes must match. Normalize unconditionally instead of
+        # branching on dtype/contiguity: torch.compile bakes those Python
+        # branches from the trace-time example, and the MTP draft head can
+        # feed fp32/non-contiguous tensors at replay, which then trips the
+        # aclnn dtype check. Both calls are no-ops when already satisfied.
+        hidden_states = hidden_states.to(self.weight.dtype).contiguous()
+        return torch_npu.npu_rms_norm(
+            hidden_states, self.weight, self.variance_epsilon
+        )[0]
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
