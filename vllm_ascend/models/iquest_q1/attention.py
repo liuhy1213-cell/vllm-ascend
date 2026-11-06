@@ -189,19 +189,6 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
-        if _EXTRA_CTX.capturing:
-            # 【临时调试 2026-11-07】捕获期打印 KV 视图布局，定位图内 [8406,256,128]→
-            # [8374,128,128] 全量拷贝来源；定位后删除。
-            print(
-                f"[iquest-kv-debug] layer={self._layer_name} state={attn_metadata.attn_state} "
-                f"kv_cache_type={type(kv_cache).__name__} "
-                f"kv_cache_shape={tuple(kv_cache.shape) if isinstance(kv_cache, torch.Tensor) else 'N/A'} "
-                f"key={tuple(key.shape)} key_stride={tuple(key.stride())} key_contig={key.is_contiguous()} "
-                f"value={tuple(value.shape)} value_contig={value.is_contiguous()} "
-                f"use_bnsd={getattr(self, 'use_bnsd_kv_cache', '?')} block_size={block_size} "
-                f"block_table={None if block_table is None else tuple(block_table.shape)}",
-                flush=True,
-            )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
