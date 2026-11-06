@@ -143,8 +143,8 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
         sparse_mode = 4 if self.sliding_window is not None else 3
         attn_output, lse = torch_npu.npu_fused_infer_attention_score_v2(
             query,
-            key.contiguous(),
-            value.contiguous(),
+            key,
+            value,
             num_query_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
             input_layout="TND",
@@ -189,13 +189,34 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
+        if _EXTRA_CTX.capturing:
+            # 【临时调试 2026-11-07】捕获期打印 KV 视图布局，定位图内 [8406,256,128]→
+            # [8374,128,128] 全量拷贝来源；定位后删除。
+            print(
+                f"[iquest-kv-debug] layer={self._layer_name} state={attn_metadata.attn_state} "
+                f"kv_cache_type={type(kv_cache).__name__} "
+                f"kv_cache_shape={tuple(kv_cache.shape) if isinstance(kv_cache, torch.Tensor) else 'N/A'} "
+                f"key={tuple(key.shape)} key_stride={tuple(key.stride())} key_contig={key.is_contiguous()} "
+                f"value={tuple(value.shape)} value_contig={value.is_contiguous()} "
+                f"use_bnsd={getattr(self, 'use_bnsd_kv_cache', '?')} block_size={block_size} "
+                f"block_table={None if block_table is None else tuple(block_table.shape)}",
+                flush=True,
+            )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             key = key[:num_tokens]
             value = value[:num_tokens]
-        key = key.contiguous()
-        value = value.contiguous()
+        # Only the no-cache (unpaged) state needs materialization: the paged
+        # cache views are K/V-interleaved at page granularity (block stride =
+        # 2 * page), which FIA consumes directly — matching the base class,
+        # which passes these views to the same op whenever block_table exists.
+        # Unconditionally materializing here copied the ENTIRE per-layer cache
+        # (2 * 276MB * 88 layers) into the ACL graph and replayed it every
+        # decode step (~30ms of the step budget on 950DT).
+        if block_table is None:
+            key = key.contiguous()
+            value = value.contiguous()
 
         has_sliding_window = self.sliding_window is not None
         fia_kwargs = {
