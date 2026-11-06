@@ -745,12 +745,20 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
             return self.build_fia_params_dcp(num_reqs_padded, draft_attn_metadata, is_draft_model_prefill)
         layer_name, metadata = next(iter(draft_attn_metadata.items()))
         block_table = metadata.block_tables
+        # SharedSource merges these dicts into the captured task kwargs
+        # verbatim, so the key names must match the FIA op variant the
+        # draft backend registered (see AscendAttentionBackend.uses_fia_v2;
+        # V1-runner twin of this logic lives in llm_base_proposer).
+        if self.attn_backend is not None and self.attn_backend.uses_fia_v2():
+            qlen_key, kvlen_key = "actual_seq_qlen", "actual_seq_kvlen"
+        else:
+            qlen_key, kvlen_key = "actual_seq_lengths", "actual_seq_lengths_kv"
         if is_draft_model_prefill:
             return [
                 {
                     "layer_name": layer_name,
-                    "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                    "actual_seq_lengths_kv": metadata.seq_lens_list,
+                    qlen_key: metadata.actual_seq_lengths_q,
+                    kvlen_key: metadata.seq_lens_list,
                     "block_table": block_table,
                 }
             ]
@@ -767,8 +775,8 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
                 fia_params.append(
                     {
                         "layer_name": layer_name,
-                        "actual_seq_lengths": query_start_loc,
-                        "actual_seq_lengths_kv": seq_lens,
+                        qlen_key: query_start_loc,
+                        kvlen_key: seq_lens,
                         "block_table": block_table,
                     }
                 )
