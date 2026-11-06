@@ -26,6 +26,7 @@ shared by the backend and the model runner.
 """
 
 import math
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -669,6 +670,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         layout_q_descale: str,
         num_tokens: int,
         output: torch.Tensor,
+        sink_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         key, value, key_scale, value_scale = kv_cache
         # The K/V caches are already the packet-packed PA_NZ 5-D strided
@@ -715,12 +717,27 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             layout_q_descale=layout_q_descale,
             layout_kv=QFA_LAYOUT_PA_NZ,
             layout_out=QFA_LAYOUT_TND,
-            return_softmax_lse=False,
+            return_softmax_lse=sink_logits is not None,
         )
         # return_softmax_lse=False yields an empty LSE tensor in the
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
         attn_output = result[0] if isinstance(result, tuple) else result
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        if sink_logits is not None:
+            # Learned-key sink correction, ported from the FIA path in
+            # vllm_ascend.models.iquest_q1.attention: the sink is an
+            # always-visible entry with a zero value, so it only changes the
+            # softmax denominator. QFA's LSE carries the same ln(sum exp
+            # (scaled logits)) convention as FIA's, but is HEAD-major
+            # ((H, T)) -- verified empirically (single-block probe: max
+            # |lse - ln| = 3e-3 under (H, T) vs 3e-1 under (T, H), identical
+            # for the TND and N2TGD kernels), unlike FIA's token-major
+            # (T, Q_N, 1). Transpose to token-major (T, H, 1) to match
+            # sink_logits.
+            lse = result[1].reshape(-1).view(self.num_heads, num_tokens)
+            lse = lse.t().reshape(num_tokens, self.num_heads, 1)
+            factor = torch.sigmoid(-(sink_logits.unsqueeze(-1) - lse.float()))
+            attn_output = (attn_output.float() * factor).to(attn_output.dtype)
         output[:num_tokens] = attn_output
         return output
 
@@ -731,6 +748,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
+        sink_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One QFA call per step for the whole batch (decode + prefill alike).
 
@@ -804,6 +822,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             layout_q_descale=layout_q_descale,
             num_tokens=num_tokens,
             output=output,
+            sink_logits=sink_logits,
         )
 
     # KV cache writes happen in reshape_and_cache(), invoked from forward()
@@ -894,6 +913,28 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 f"{len(kv_cache) if kv_cache is not None else 0}."
             )
 
+        # IQuest-Q1 learned-key sink: an always-visible KV entry with a zero
+        # value, so it only rescales the softmax denominator. QFA owns the
+        # cache read, so request its LSE and fold the correction in _run_qfa
+        # (same formula as the FIA path in vllm_ascend.models.iquest_q1.
+        # attention). sink_logit = scale * (q . sink_k[kv head]) on the raw
+        # bf16 query, computed before dynamic quantization.
+        # C8_DISABLE_SINK=1 skips the correction (A/B diagnostic for the QFA
+        # LSE convention).
+        sink_key = getattr(layer, "sink_key", None)
+        if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
+            sink_key = None
+        sink_logits = None
+        if sink_key is not None:
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            group = self.num_heads // self.num_kv_heads
+            q = query[:num_actual_tokens].reshape(
+                num_actual_tokens, self.num_kv_heads, group, self.head_size
+            )
+            sink_logits = (
+                (q.float() * sink_key.float().unsqueeze(1)).sum(-1) * self.scale
+            ).reshape(num_actual_tokens, self.num_heads)
+
         record_attention_compute_start()
 
         query_mxfp8, query_scale = torch_npu.npu_dynamic_mx_quant(
@@ -926,4 +967,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
-        return self._forward_mxfp8_attention(query_mxfp8, query_scale, kv_cache, attn_metadata, output)
+        return self._forward_mxfp8_attention(
+            query_mxfp8, query_scale, kv_cache, attn_metadata, output, sink_logits=sink_logits
+        )
