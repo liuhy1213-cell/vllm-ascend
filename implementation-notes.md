@@ -447,6 +447,23 @@ sink 复测 + 长稳）是硬闸门。窗口即视图探针价值重定位：D �
 已验证，但端到端被 ①②锁死——留作 CANN 修 mode4 或传输量化落地后的现成方案，
 当下不投工程。
 
+**S2 的价值链存档（2026-11-08 定稿，避免下一轮从头论证）**：
+
+S1+S4 落地后（稳态 8,623 tok/s/卡，TTFT p99 4.72 唯一破项，TPOT 23.5 贴 SLA 25，
+等效权重流 ≈970 GB/s/卡已贴 950DT HBM 上限），剩余杠杆全部定性完毕：
+- **S3 暂缓**：权重流贴带宽 ⇒ 元素级优化（标量折叠/norm 融合/lm_head）最多回收
+  2–5%；MTP 深度 A/B（n=3 vs n=5：6,448 vs 6,388 但 TPOT/TTFT 全劣，accept 前可–3
+  个 token 饱和）说明"靠 accept 提吞吐"也到头。定稿于 02ceec158。
+- **S2 = 唯一剩下的量级可观结构性杠杆**，两个独立解锁条件，收益二选一取大：
+  | 解锁条件 | 范围 | 收益 |
+  |---|---|---|
+  | A：混合页距 allocator（`can_overlay_attention_kv_groups()` 支持 per-group page） | full 组 C8、滑窗 bf16 | P/D 池 ~1.27×（吞吐封顶 +27%，TTFT 队列 −21%） |
+  | B：CANN 支持 mode4（或 win 参数出 mode4） | 两组同时 C8（每层 page 均 32KB ⇒ overlay 相等判定自然成立，**无需 allocator 改造**）+ D 侧窗口即视图已验证 + P 侧 prefill 滑窗走 mode4 | **P/D 池 2×**，TTFT 破项修复 |
+  当前卡点：A 难在分配器（layer-outer 单一 backing 下混合页距会 offset 互压）；
+  B 难在 CANN kernel（tiling 硬拒，本节探针已存证）。
+- 精度闸门（任一解锁后）：GSM8K ≥95（raw）+ sink attention 复测（quant/README
+  坑 #7）+ 长稳；当前 95/96 为 bf16 KV 对照基线。
+
 ### S3 D 侧步进
 
 **2026-11-08 实测后的定位（重要）**：
