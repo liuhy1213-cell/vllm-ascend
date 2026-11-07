@@ -459,6 +459,7 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
 | **S4** | 同上 | rate 2.2 | **6,388** | 20.84 ms | 3.01 s | `pd_s4_open22r1.json`（SLA 内最好点） |
 | **S4** | 同上 | rate 2.3 | 6,657 / 6,604 | 22.88 / 22.46 ms | 3.07 ✅ / 4.21 ⚠ | `pd_s4_open23r{1,2}.json`（临界） |
 | **S4** | 同上 | rate 2.4 | 6,741 | 22.70 ms | **4.31 ❌** | `pd_s4_open24r1.json` |
+| 对照 | 同上，**无共享前缀**（prefix0，输入 64k） | rate 1.0 | 1,605 | 11.73 ms | **78.6 s ❌** | `pd_prefix0_r1.json`｜P 侧 prefill 算力打满 |
 
 **S1 结论（2026-11-08）**
 
@@ -481,6 +482,10 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
   rate 0.9 时 p99 TTFT 已破到 7.6 s、rate 1.8 时 49.6 s ⇒ baseline 的可用工作点只有 rate ~0.7。
   ⇒ **SLA 内吞吐 2,243 → 5,065（2.26×）**，不是靠放开并发换来的假收益（两侧同一份代码、
   同一份部署参数、同一把度量）。
+- **口径边界（prefix0 对照）**：把 `--random-prefix-len` 置 0、输入 64k（无共享前缀）后，
+  rate 1.0 只能到 1,605 tok/s/卡、p99 TTFT 78.6 s —— P 侧 prefill 算力成为瓶颈
+  （1.0 req/s × 64k = 64k tok/s 需求，超过 P 实测峰值 ~38.5k tok/s）。
+  ⇒ **6,388 这个数成立的前提是目标口径的 90% 共享前缀**；无共享前缀时瓶颈位置不同。
 - **精度**：GSM8K-100 经 PD proxy（P prefill → hybrid KV 传输 → D decode）**95/100**，
   5 条截断、0 错误 —— 与 `-opt` 栈基线画像（94–95 + 3–4 截断）一致。
 - **正确性闸门**：`correctness_gate.sh` 5 档 prompt 长度（50/200/600/1200/3000 词）
