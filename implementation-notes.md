@@ -327,6 +327,32 @@ D 侧滑窗 KV 是前一个请求的残留 ⇒ 输出随残留内容漂移（解
 - **回退阶梯**：(a) 保留 hybrid 但去掉 AscendStore 池（单 `MooncakeHybridConnector`）；
   (b) 只 D 侧 hybrid；(c) 回退原状。
 
+### S2 前置复核：当前部署**没有任何 C8 KV**，且 overlay 要求两组页大小相同
+
+2026-11-08 从两次运行的实测反推（`num_blocks` 来自 connector 的注册日志）：
+
+| 运行 | available | num_blocks | bytes_per_block | 理论值 |
+|---|---|---|---|---|
+| hybrid + W8A8C8 | 45.62 GiB | 28,748 | **1.7039 MB** | 26 层 × 64KB = 1.7039 MB ✓ |
+| hybrid + W4A4C8 | 63.98 GiB | 40,315 | **1.7037 MB** | 同上 ✓ |
+
+⇒ `bytes_per_block` 由 **full 组 26 层 × bf16 页（64KB）** 钉住，**没有 C8**。
+日志也直接给出证据：`modelslim_config.py:466` 明确警告
+"The checkpoint carries an MXFP8 KV recipe, but --kv-cache-dtype is not 'mxfp8';
+the recipe is not enabled"，且所有层的注册日志都是 `page=65536 B`（含 full 层，
+如 `model.layers.87`）。`kv_cache_dtype=auto`。
+
+**两条结论**：
+
+1. **只把滑窗组 C8 化 = 零增益**（计划 §自检 问题 3 的结论成立）。
+2. **只把 full 组 C8 化也不行 —— 不只是零增益，而是会退回到"每层私有 buffer"**：
+   我加的自适应 overlay 判定 `can_overlay_attention_kv_groups()` 要求
+   **各组 page_size_bytes 相同**（overlay 的物理前提：同一 block id 在不同组里
+   必须能互相同一片存储）。若 full 组 32KB / sliding 组 64KB，判定返回 False
+   ⇒ 走回每层私有分配 + 预算乘 0.29 ⇒ 容量从 40,315 block 掉到 ~2,900。
+   ⇒ **S2 只有一条可行路线：full + sliding 同时 C8（两组都 32KB），
+   收益 ≈ 2×（1.70 → 0.85 MB/block）**；若要分批上，必须先扩展 overlay 支持混合页距。
+
 ### S2 KV-C8（mxfp8 KV cache）
 
 - **关键结论**：上次 C8 崩溃的根因就是"合组"，所以 **S1 是 S2 的前置**。
