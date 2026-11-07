@@ -1,11 +1,46 @@
-# IQuest-Q1 PD 分离部署性能优化记录
+# IQuest-Q1 PD 分离部署性能优化记录（implementation notes）
 
-> 本文件是 IQuest-Q1 在 **PD 分离（1P1D）部署**下的性能工作日志。
-> 每次改动的**代码与本条记录放在同一个 commit**，保证代码与记录永不脱节。
-> 记录里的所有数字必须来自
-> `deploy/iquest-1p1d-2m-mooncake-new78/logs/bench/*.json` 与两侧 `engine.log`。
+> **本文件是 IQuest-Q1 PD 分离（1P1D）部署性能优化的活记录**，随代码一起演进。
 >
-> 模型的移植说明、sink 数学、ACL graph 细节见同目录的 `README.md`；本文件只记性能。
+> **维护纪律**
+> 1. 每次改动的**代码与本条记录放在同一个 commit** —— 代码与记录永不脱节。
+> 2. 记录里的所有数字必须来自实测：
+>    `deploy/iquest-1p1d-2m-mooncake-new78/logs/bench/*.json` 与两侧 `engine.log`；
+>    禁止写入"预计/应该/约等于"。
+> 3. 每条记录固定六段：**假设 → 改动 → 测量 → 结论 → 回滚开关 → 踩到的坑**。
+>    证伪的尝试**也要写**（保留负结果，避免后人重做）。
+> 4. 分支：`perf/iquest-pd-hybrid-kv-20261108`（基点 `72dedd23c` = `-prof` HEAD）；
+>    worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
+> 5. 模型的移植说明、sink 数学、ACL graph 细节见
+>    `vllm_ascend/models/iquest_q1/README.md`；本文件只记性能。
+> 6. 计划全文见工作区 `docs/PD_hybrid_kv_优化计划.md`。
+
+---
+
+## 0. 进度索引
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| S0 | 分支 + 基线固化 + 生产侧 EE1006 同步 | 🟡 分支/记录已建；基线复测与生产同步未做 |
+| S1 | 重新启用 hybrid KV cache manager（核心解锁） | ⬜ |
+| S2 | KV-C8（mxfp8 KV cache）落在 25 个 full 层 | ⬜ |
+| S3 | D 侧步进优化 | ⬜ |
+| S4 | W4A4C8 权重 | ⬜ |
+| S5 | 精度闸门 + 长稳 + 回合主干 | ⬜ |
+
+---
+
+## 1. 范围与验收口径
+
+| 项 | 值 |
+|---|---|
+| 部署 | `deploy/iquest-1p1d-2m-mooncake-new78`（P0=new7 `10.222.36.53`，D0=new8 `10.222.41.88`） |
+| 拓扑 | 每侧 1 进程 × TP8；P = prefill + proxy(:1999)，D = decode(+MTP eagle n=5 + ACL graph) |
+| 权重 | `/models/IQuest-Q1-W8A8C8-mxfp8`（`--quantization ascend`），D 侧 draft = `/models/IQuest-Q1/mtp` |
+| 负载 | 64k in / 1k out，`prefix 0.9`（`--random-prefix-len 57600 --random-input-len 6400 --random-output-len 1000`），`--ignore-eos` |
+| SLA | **mean TPOT ≤ 25 ms** 且 **p99 TTFT ≤ 4 s** |
+| 指标 | `total_token_throughput / 16`（P8 + D8 共 16 卡）= tok/s/卡 |
+| 目标 | **2,201 → 6,000 tok/s/卡**（对齐 colocated 6000@SLA 的水平） |
 
 ---
 
@@ -80,14 +115,46 @@ P 侧供给余量充足（实测峰值 38.5k tok/s，2.4 req/s × 6,400 = 15.4k 
 
 ## 3. 阶段计划
 
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| S0 | 分支 + 基线固化 + 生产侧 EE1006 同步 | ⏳ 进行中 |
-| S1 | **重新启用 hybrid KV cache manager**（核心解锁） | ⬜ |
-| S2 | KV-C8（mxfp8 KV cache）落在 25 个 full 层 | ⬜ |
-| S3 | D 侧步进优化（并发上去后的 TPOT 约束） | ⬜ |
-| S4 | W4A4C8 权重 | ⬜ |
-| S5 | 精度闸门 + 长稳 + 回合主干 | ⬜ |
+（进度索引见 §0；此处只列每阶段的技术要点，结论一律回填到 §4/§5。）
+
+### 3.1 S1 的代码侧结论（2026-11-08 读码，**未上机验证**）
+
+**结论：S1 不需要改 iquest 模型代码，只需要部署侧去掉 `--disable-hybrid-kv-cache-manager`。**
+下面四条是支撑该结论的读码结果，也是 S1 上机时最该先验的几点：
+
+1. **vLLM 侧确实会分成 2 组。**
+   `Attention.__init__`（`vllm/model_executor/layers/attention/attention.py:263-265`）
+   优先取 `per_layer_sliding_window` ⇒ iquest 的 63 个滑窗层拿到
+   `SlidingWindowSpec(4096)`、25 个 full 层拿到 `FullAttentionSpec`。
+   只有 `--disable-hybrid-kv-cache-manager` 才会触发
+   `kv_cache_utils.py:2266 → unify_hybrid_kv_cache_specs()`（`:1919`）把滑窗层提升成 full。
+
+2. **MTP draft 必须继续清 `sliding_window`（`model.py:414-424` 的现有行为保留）。**
+   若改成保留真实的 `SlidingWindowSpec(512)`，D 侧会变成 **3 组**
+   （full 25 / sliding 63 / draft 1）而 P 侧只有 2 组（P 无 draft）⇒ 组数不对齐。
+   保持清空则两侧都是 2 组，draft 并入 full 组。
+
+3. **P 侧 88 层 vs D 侧 89 层（多 1 层 draft）的差异已被连接器处理。**
+   `mooncake_hybrid_connector.py:891-895`：D 侧 `speculative_config is not None` 时
+   把 layer 区间 `+1`，而 `zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)`
+   以较短的一边为准 ⇒ D 多出来的 draft 条目"绑在最后、永远不被拉取"。
+   hybrid 分支的地址注册顺序取自 `kv_cache_config.kv_cache_tensors` 描述符顺序
+   （`:1855-1873`），draft 的描述符在目标层之后注册 ⇒ 前 88 层两边一一对应。
+
+4. **S2 的硬门槛是 1 行白名单。**
+   `attention_c8_mxfp.py:898-908` 要求 `uses_mooncake_connector()` 为真，
+   而 `vllm_ascend/utils.py:1629` 的集合
+   `{"MooncakeConnector", "MooncakeConnectorV1", "MooncakeConnectorV2"}`
+   **不含 `"MooncakeHybridConnector"`** ⇒ C8 + 当前 PD 配置会直接 NotImplementedError。
+
+**上机前仍未验证的 3 个未知（按风险排序）**：
+- a) 两组 block size 能否共存（full 组 C8=512 / sliding 组 bf16=128）——
+   vLLM `_align_hybrid_block_size` 要求各组兼容，Ascend 在 `platform.py:405-418` 对 C8 有专门分支。
+- b) `get_sw_clipped_blocks`（`:1397-1412`）的 `assert len(block_ids) == len(self.num_swa_blocks)`
+   在 hybrid 下是否两侧组数一致即通过。
+- c) `AscendMetadata` 只有一份 `block_tables`，hybrid 多组不同 block table 时
+   运行时是否正确寻址（这是唯一可能真要改模型/attention 代码的地方）。
+
 
 ### S1 重新启用 hybrid KV cache manager
 

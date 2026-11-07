@@ -1626,7 +1626,19 @@ def is_gqa_backend(vllm_config: VllmConfig) -> bool:
 
 
 def uses_mooncake_connector(kv_transfer_config: Any) -> bool:
-    mooncake_connector_names = {"MooncakeConnector", "MooncakeConnectorV1", "MooncakeConnectorV2"}
+    # MooncakeHybridConnector is the Mooncake connector that understands
+    # hybrid KV cache groups: it registers one region per configured backing
+    # storage (kv_p2p/mooncake/utils.py: collect_configured_register_regions)
+    # and moves every per-layer cache tensor of a group, including the E8M0
+    # scale caches of the C8-MXFP layout. The plain MooncakeConnector moves
+    # only the K/V pair, which is why the C8-MXFP attention path refuses any
+    # connector outside this set (attention/attention_c8_mxfp.py).
+    mooncake_connector_names = {
+        "MooncakeConnector",
+        "MooncakeConnectorV1",
+        "MooncakeConnectorV2",
+        "MooncakeHybridConnector",
+    }
     return bool(_collect_kv_connector_names(kv_transfer_config) & mooncake_connector_names)
 
 
