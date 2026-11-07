@@ -1,0 +1,174 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+#
+"""Fused Triton kernel for the iQuest-Q1 learned sink-key correction.
+
+The reference computation (see
+``vllm_ascend/models/iquest_q1/attention.py::_apply_sink_key``) folds a
+learned per-kv-head sink key into the attention output:
+
+    logit[t, h]  = scale * sum_d(q[t, h, d] * sink_k[h // group, d])
+    factor[t, h] = sigmoid(lse[t, h] - logit[t, h])
+    out[t, h, d] *= factor[t, h]
+
+The pure-torch implementation needs ~6 device kernels per call (bmm,
+casts, Muls, Sub, Sigmoid, in-place Mul). At decode batch sizes every one
+of those kernels costs a fixed few us of launch/tile overhead, which
+dwarfs the actual data volume (~0.4MB per call per rank), so the chain
+still costs ~2ms per decode step across 88 layers (2-2.5% of device time,
+measured on 8x950DT at conc28).
+
+This kernel fuses the whole chain into a single elementwise pass that
+reads q, lse and sink directly (no permute copy) and updates the output
+in place.
+
+Numerics: bf16 products are exact in the fp32 accumulator, so versus the
+torch path the only differences are (a) fp32 summation order inside the
+dot product and (b) one ULP-level sigmoid difference - both far below the
+bf16 output quantum. The kernel hard-codes the torch path's intermediate
+bf16 roundings (sink cast, bmm output, factor cast) so the outputs stay
+bit-identical for the vast majority of elements (microbench on 950DT:
+100% bitwise over production-like and adversarial shapes).
+"""
+
+import torch
+from vllm.triton_utils import tl, triton
+
+from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+# Rows (one row = one (token, head) pair of HEAD_DIM elements) processed
+# per program iteration. A (BLOCK_ROWS, HEAD_DIM) fp32 tile costs
+# ~3 * BLOCK_ROWS * HEAD_DIM * 4 bytes of unified buffer, which keeps
+# BLOCK_ROWS=32 at ~48KB - well within the 950DT UB budget.
+_SINK_BLOCK_ROWS = 32
+
+
+@triton.jit
+def _triton_sink_apply(
+    q_ptr,  # [T*H, D] bf16 (kv-major head layout, contiguous rows)
+    out_ptr,  # [T*H, D] bf16, updated in place
+    sink_ptr,  # [KV, D] fp32 master weights
+    lse_ptr,  # [T*H] fp32 (TND LSE flattened)
+    scale,
+    num_rows,
+    NUM_HEADS: tl.constexpr,  # H (per rank)
+    GROUP: tl.constexpr,  # query heads per kv head
+    HEAD_DIM: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SINK_1D: tl.constexpr,  # single kv head: load the sink row once
+):
+    # One program per BLOCK_ROWS tile, no row loop: each tile has a serial
+    # load -> dot -> sigmoid -> store dependency chain, so per-program
+    # sequential tiles kill throughput on prefill (one program per tile keeps
+    # every vector core busy instead). Max grid = 8192*H/32 = 1536 programs.
+    pid = tl.program_id(0)
+    d_offs = tl.arange(0, HEAD_DIM)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+
+    mask = rows < num_rows
+    if SINK_1D:
+        # Single kv head per rank (this model under TP8): every row of the
+        # tile shares one sink vector, so load it once as a flat 1-D load and
+        # broadcast. The generic 2-D gather below has non-affine addresses
+        # and defeats vectorized loads (~25x slower on prefill).
+        sink_row = tl.load(sink_ptr + d_offs).to(tl.bfloat16).to(tl.float32)
+        sink = tl.broadcast_to(sink_row[None, :], (BLOCK_ROWS, HEAD_DIM))
+    else:
+        # head h belongs to kv head h // group (kv-major head layout)
+        kv = (rows % NUM_HEADS) // GROUP
+        sink = tl.load(
+            sink_ptr + kv[:, None] * HEAD_DIM + d_offs[None, :],
+            mask=mask[:, None],
+            other=0,
+        )
+        sink = sink.to(tl.bfloat16).to(tl.float32)
+    q_tile = tl.load(
+        q_ptr + rows[:, None] * HEAD_DIM + d_offs[None, :],
+        mask=mask[:, None],
+        other=0,
+    ).to(tl.float32)
+    logit = tl.sum(q_tile * sink, axis=1)
+    # replicate the torch path's bf16 bmm output rounding
+    logit = logit.to(tl.bfloat16).to(tl.float32)
+    lse_val = tl.load(lse_ptr + rows, mask=mask, other=0).to(tl.float32)
+    factor = tl.sigmoid(lse_val - logit * scale)
+    # replicate factor.to(attn_output.dtype): >=0.998 rounds to exactly
+    # 1.0 in bf16, keeping the common case bit-exact.
+    factor = factor.to(tl.bfloat16).to(tl.float32)
+    out_tile = tl.load(
+        out_ptr + rows[:, None] * HEAD_DIM + d_offs[None, :],
+        mask=mask[:, None],
+        other=0,
+    ).to(tl.float32)
+    result = (out_tile * factor[:, None]).to(out_ptr.dtype.element_ty)
+    tl.store(
+        out_ptr + rows[:, None] * HEAD_DIM + d_offs[None, :],
+        result,
+        mask=mask[:, None],
+    )
+
+
+def sink_apply_triton(
+    query: torch.Tensor,
+    attn_output: torch.Tensor,
+    lse: torch.Tensor,
+    sink_key: torch.Tensor,
+    scale: float,
+    num_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Fold the learned sink into ``attn_output[:num_tokens]`` in place.
+
+    ``query`` and ``attn_output`` are the FIA operand/output slices with the
+    kv-major head layout ``(num_tokens, num_heads, head_dim)`` (a flat
+    ``(num_tokens, num_heads * head_dim)`` view works too); ``lse`` is the
+    TND softmax LSE, ``(num_tokens, num_heads[, 1])``. ``attn_output`` must
+    be contiguous (the FIA output buffer is) since the update is in place.
+    """
+    if not query.is_contiguous():
+        query = query.contiguous()
+    assert attn_output.is_contiguous(), "in-place sink update needs a contiguous output"
+    q2d = query.reshape(num_tokens * num_heads, head_dim)
+    out2d = attn_output.reshape(num_tokens * num_heads, head_dim)
+    # LSE arrives as (T, H, 1) or (T, H); both flatten to one fp32 value per
+    # (token, head) pair. Reshape first (free for contiguous input), then
+    # materialize if a non-contiguous layout slips through.
+    lse2d = lse.reshape(num_tokens, num_heads)
+    if not lse2d.is_contiguous():
+        lse2d = lse2d.contiguous()
+
+    num_rows = num_tokens * num_heads
+    if num_rows == 0:
+        return
+    init_device_properties_triton()  # idempotent; needed for standalone callers
+    # One program per tile: max grid = 8192-token chunk -> 1536 programs, all
+    # vector cores busy; smaller token counts launch proportionally less.
+    grid = triton.cdiv(num_rows, _SINK_BLOCK_ROWS)
+    _triton_sink_apply[(grid,)](
+        q2d,
+        out2d,
+        sink_key,
+        lse2d,
+        scale,
+        num_rows,
+        NUM_HEADS=num_heads,
+        GROUP=num_heads // num_kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_ROWS=_SINK_BLOCK_ROWS,
+        SINK_1D=(num_kv_heads == 1),
+    )

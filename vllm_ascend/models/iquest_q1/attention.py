@@ -57,6 +57,7 @@ from vllm_ascend.compilation.updatable_graph import get_capture_resource, regist
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     attention_transfer_window,
 )
+from vllm_ascend.ops.triton.sink import sink_apply_triton
 
 
 class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
@@ -252,49 +253,29 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
 
         Equivalent to the reference Triton kernel: the sink is an always-visible
         entry with a zero value, so it only changes the softmax denominator.
+
+        A single fused Triton kernel reads q / LSE / sink directly and applies
+        the correction in place, replacing the ~6-kernel torch chain (bmm,
+        casts, Muls, Sub, Sigmoid, Mul) whose per-kernel launch overhead
+        dominates at decode batch sizes. It replicates the torch path's
+        intermediate bf16 roundings, so outputs stay bit-identical for the
+        vast majority of elements (see ``vllm_ascend/ops/triton/sink.py``).
+        Like ``_triton_rope``, the launch is capturable into the ACL decode
+        graph.
         """
         sink_key = self._sink_key
         assert sink_key is not None
-        num_heads = self.num_heads
-        num_kv_heads = self.num_kv_heads
-        head_size = self.head_size
-        group = num_heads // num_kv_heads
-
-        # Query heads are laid out kv-major: head h belongs to kv head h // group.
-        q = query[:num_tokens].reshape(num_tokens, num_kv_heads, group, head_size)
-        # One batched per-kv-head GEMV instead of a [T, KV, G, D] fp32 product
-        # tensor plus a reduction. bf16 products are exact in the fp32
-        # accumulator, so versus the elementwise path the only difference is one
-        # bf16 rounding of the finished logit (<= ~0.3% relative, far below the
-        # bf16 output quantum); the permute keeps the GEMV large instead of
-        # degrading aclnnMatmul's broadcast-batch tiling on long prefill chunks.
-        sink_w = sink_key.to(q.dtype).unsqueeze(-1)  # [KV, D, 1]
-        sink_logit = (
-            torch.bmm(
-                q.permute(1, 0, 2, 3).reshape(
-                    num_kv_heads, num_tokens * group, head_size
-                ),
-                sink_w,
-            )  # [KV, T*G, 1]
-            .reshape(num_kv_heads, num_tokens, group)
-            .permute(1, 0, 2)  # [T, KV, G]
-            .float() * self.scale
-        ).reshape(num_tokens, num_heads)  # [T, H]
-
-        # TND LSE shape is (T, Q_N, 1); tolerate a (T, Q_N) 2D return as well.
-        if lse.dim() == 3:
-            lse = lse.reshape(num_tokens, num_heads, 1)
-        else:
-            lse = lse.reshape(num_tokens, num_heads).unsqueeze(-1)
-        lse = lse.float()
-
-        # sigmoid(lse - logit) == sigmoid(-(logit - lse)) without the Neg kernel.
-        factor = torch.sigmoid(lse - sink_logit.unsqueeze(-1))  # [T, H, 1]
-        # factor rounds to exactly 1.0 in bf16 whenever it is >= 0.998, so the
-        # common case stays bit-exact; only genuinely suppressed heads see a
-        # <= ~0.2% relative change (one bf16 rounding instead of the fp32
-        # round-trip).
-        attn_output.mul_(factor.to(attn_output.dtype))
+        sink_apply_triton(
+            query[:num_tokens],
+            attn_output[:num_tokens],
+            lse,
+            sink_key,
+            self.scale,
+            num_tokens,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+        )
 
 
 class IQuestQ1AscendAttentionBackend(AscendAttentionBackend):
