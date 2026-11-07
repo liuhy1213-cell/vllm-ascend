@@ -460,6 +460,13 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
 | **S4** | 同上 | rate 2.3 | 6,657 / 6,604 | 22.88 / 22.46 ms | 3.07 ✅ / 4.21 ⚠ | `pd_s4_open23r{1,2}.json`（临界） |
 | **S4** | 同上 | rate 2.4 | 6,741 | 22.70 ms | **4.31 ❌** | `pd_s4_open24r1.json` |
 | 对照 | 同上，**无共享前缀**（prefix0，输入 64k） | rate 1.0 | 1,605 | 11.73 ms | **78.6 s ❌** | `pd_prefix0_r1.json`｜P 侧 prefill 算力打满 |
+| **稳态** | 同上，10 分钟长跑（1400 prompts） | rate 2.2 | **8,623** | 23.51 ms | **4.72 s ⚠** | `pd_soak22.json`｜实测 2.12 req/s、accept 2.6、无 preempt |
+
+**⚠ 短跑 vs 稳态（测量口径）**：上表 40–130 prompts 的短跑含 ramp-up/drain，实际完成速率
+低于名义 rate（例：W4A4 rate 2.2 跑 120 prompts 时 `request_throughput` 只有 1.57 req/s）⇒
+短跑数字只能同协议横向比较。10 分钟稳态（1400 prompts @ rate 2.2）实测：
+**2.12 req/s、8,623 tok/s/卡、TPOT 23.5 ms、p99 TTFT 4.72 s**（TTFT 是新的约束，
+比短跑外推的 6,388 更乐观、但 TTFT 略破 SLA）。基线侧稳态未测。
 
 **S1 结论（2026-11-08）**
 
