@@ -172,13 +172,17 @@ class IQuestQ1MoEBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
+        # Router GEMM: keep fp32 *logits* (top-k stability) but compute the
+        # matmul in bf16 with fp32 accumulation. With force_fp32_compute the
+        # weights are stored/computed as fp32 on NPU, which showed up as a
+        # 42 ms fp32 MatMul per 8192-token prefill chunk (~15% of prefill).
         self.gate = GateLinear(
             hidden_size,
             num_experts,
             bias=False,
-            params_dtype=None if router_dtype == torch.float32 else router_dtype,
-            out_dtype=router_dtype,
-            force_fp32_compute=router_dtype == torch.float32,
+            params_dtype=None,
+            out_dtype=torch.float32,
+            force_fp32_compute=False,
             prefix=f"{prefix}.gate",
         )
 
