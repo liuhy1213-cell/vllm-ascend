@@ -45,6 +45,9 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -313,6 +316,16 @@ class IQuestQ1Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # [L3 perf] Optional fused o_proj GEMM + TP AllReduce (npu_mm_all_reduce_base),
+        # gated by additional_config "enable_fused_o_proj_ar". Unsupported configs
+        # (scheme/TP/weights) are logged once and keep the unfused path.
+        if get_ascend_config().enable_fused_o_proj_ar:
+            if (reason := OProjMMAllReduceOp.unsupported_reason(self.o_proj)) is None:
+                self.o_proj.custom_op = OProjMMAllReduceOp(self.o_proj)
+            else:
+                logger.warning(
+                    "iquest o_proj fused MM+AllReduce disabled for %s: %s", prefix, reason
+                )
 
         self.rotary_dim = getattr(config, "rotary_dim", None)
         rope_parameters = dict(getattr(config, "rope_parameters", None) or {})

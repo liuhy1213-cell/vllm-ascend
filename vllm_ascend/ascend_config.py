@@ -438,6 +438,7 @@ class AscendConfig:
             "mega_moe_max_tokens": 65536,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "enable_fused_mc2": 0,
+            "enable_fused_o_proj_ar": 0,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
@@ -603,6 +604,10 @@ class AscendConfig:
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
+    # 1 = fuse the quantized o_proj GEMM with its TP AllReduce via
+    # npu_mm_all_reduce_base (CANN MC2 family). Model-scoped opt-in: only
+    # models that attach OProjMMAllReduceOp react to it (iquest_q1).
+    enable_fused_o_proj_ar: int = 0
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have

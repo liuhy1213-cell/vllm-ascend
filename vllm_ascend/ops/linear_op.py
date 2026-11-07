@@ -260,6 +260,91 @@ class KimiOProjMMReduceScatterOp(CustomRowParallelOp):
         return padded_tokens * weight.shape[0] * weight.element_size() < self.MAX_COMM_BYTES
 
 
+class OProjMMAllReduceOp(CustomRowParallelOp):
+    """Fuse a quantized o_proj GEMM with its TP AllReduce (npu_mm_all_reduce_base).
+
+    Replaces the sequential ``npu_dynamic_quant -> npu_quant_matmul -> HCCL
+    all_reduce`` chain of a W8A8_DYNAMIC RowParallelLinear (e.g. iquest_q1's
+    o_proj) with the CANN MC2-family fused op, which pipelines the GEMM with
+    the collective instead of exposing the AllReduce after it. Numerics match
+    the unfused path: int8 weights with per-channel dequant scale and
+    per-token dynamically quantized activations.
+
+    Scheme membership is checked by class name on purpose: importing the
+    quantization scheme classes here would create an import cycle between
+    ``vllm_ascend.ops`` and ``vllm_ascend.quantization``.
+    """
+
+    SUPPORTED_TP_SIZES = (4, 8)
+    MIN_LOCAL_K = 256
+
+    @staticmethod
+    def unsupported_reason(layer) -> str | None:
+        if layer.custom_op is not None:
+            return "o_proj MM AllReduce fusion requires the original TP group."
+        quant_method = getattr(layer, "quant_method", None)
+        if type(quant_method).__name__ != "AscendW8A8DynamicLinearMethod":
+            return "o_proj MM AllReduce fusion requires the W8A8_DYNAMIC linear scheme."
+        if quant_method.act_quant_type != torch.int8:
+            return "o_proj MM AllReduce fusion requires int8 activation quant."
+        if layer.bias is not None:
+            return "o_proj MM AllReduce fusion requires a bias-free o_proj."
+        if not callable(getattr(torch_npu, "npu_mm_all_reduce_base", None)):
+            return "o_proj MM AllReduce fusion requires torch_npu npu_mm_all_reduce_base."
+        if get_tp_group().world_size not in OProjMMAllReduceOp.SUPPORTED_TP_SIZES:
+            return (
+                "o_proj MM AllReduce fusion requires TP size in "
+                f"{OProjMMAllReduceOp.SUPPORTED_TP_SIZES}."
+            )
+        weight = getattr(layer, "weight", None)
+        if weight is None or weight.ndim != 2 or weight.dtype != torch.int8:
+            return "o_proj MM AllReduce fusion requires 2D int8 weights."
+        if weight.shape[1] < OProjMMAllReduceOp.MIN_LOCAL_K:
+            return (
+                "o_proj MM AllReduce fusion requires local K >= "
+                f"{OProjMMAllReduceOp.MIN_LOCAL_K}."
+            )
+        return None
+
+    def __init__(self, layer):
+        super().__init__(layer)
+        if reason := self.unsupported_reason(layer):
+            raise ValueError(reason)
+        self.update_attrs()
+        device_group = self.comm_group.device_group
+        backend = device_group._get_backend(torch.device("npu"))
+        self.hcom = backend.get_hccl_comm_name(self.tp_rank)
+
+    def _can_fuse(self, input_parallel: torch.Tensor) -> bool:
+        return (
+            input_parallel.ndim == 2
+            and input_parallel.shape[0] > 0
+            and input_parallel.shape[1] == self.layer.weight.shape[0]
+        )
+
+    def apply_impl(self, input_: torch.Tensor) -> tuple[torch.Tensor, None]:
+        input_parallel = self.get_input_parallel(input_)
+        if not self._can_fuse(input_parallel):
+            output = self.quant_method.apply(self.layer, input_parallel, None)
+            if self.reduce_results:
+                output = self.comm_group.all_reduce(output)
+            return output, None
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(
+            input_parallel, dst_type=self.quant_method.act_quant_type
+        )
+        if pertoken_scale.dim() == 2:
+            quantized_x = quantized_x.squeeze(dim=1)
+            pertoken_scale = pertoken_scale.squeeze(dim=1)
+        output = torch_npu.npu_mm_all_reduce_base(
+            quantized_x,
+            self.layer.weight,
+            self.hcom,
+            dequant_scale=self.layer.weight_scale_fp32,
+            pertoken_scale=pertoken_scale,
+        )
+        return output, None
+
+
 class MLPColumnParallelOp(CustomColumnParallelOp):
     def __init__(self, layer):
         super().__init__(layer)
