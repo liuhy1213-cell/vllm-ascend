@@ -101,15 +101,55 @@ worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
 | 开 hybrid manager | 819 MB | 132 MB（4096 窗口） | **0.95 GB** | ~48 |
 | + KV-C8（仅 full 层） | 410 MB | 132 MB | **0.54 GB** | ~85 |
 
-### 2.5 吞吐模型（说明 6000 为什么可达）
+### 2.5 吞吐模型（并发数待实测校正）
 
 现状：并发上限 16（P 15.9 / D 16.8 取小），每请求驻留 ≈ 20 s
 （TTFT + 1000 token × ~16 ms TPOT）⇒ 到达率上限 16/20 ≈ **0.8 req/s**
 ⇒ 输出 541.7 tok/s ⇒ **2,201 tok/s/卡**。
 
-hybrid 打开后并发上限 ≈ 48 ⇒ 到达率 ≈ 2.4 req/s ⇒ 输出 ≈ 1,600 tok/s ⇒ **≈ 6,000 tok/s/卡**，
-且 **TPOT 仍是 16 ms**（远低于 25 ms SLA）。
-P 侧供给余量充足（实测峰值 38.5k tok/s，2.4 req/s × 6,400 = 15.4k 需求）。
+机制成立（瓶颈是显存里的并发数，不是算力），**但并发数的外推是错的**（见 §2.6）。
+
+| 并发上限 | 到达率 | 输出 tok/s | tok/s/卡 |
+|---|---|---|---|
+| 16（现状，实测） | 0.8 req/s | 541.7 | 2,201 |
+| **~25**（hybrid，按 block 池算法推算） | 1.25 req/s | ~845 | **~3,300** |
+| **~47**（hybrid + full 组 block 512，推算） | 2.35 req/s | ~1,600 | **~6,000** |
+
+### 2.6 【勘误】并发外推错误：vLLM 是共享 block 池，每块成本取最大组
+
+2026-11-08 读 vLLM v0.30 `vllm/v1/core/kv_cache_utils.py` 发现的分配逻辑：
+
+- `bytes_per_block = max over groups of (Σ 该组各层的 page_size_bytes)` —— `:1596-1605`
+- `num_blocks = available_memory // bytes_per_block` —— `:1750`（**全局一个 block 池**）
+- 一个请求从**每个组**各占 block（`:1083-1094` 求和）
+- 每层的 page 会被 `unify_kv_cache_spec_page_size`（`:1365`，在 `:2312` 被调用）
+  **补齐到所有层里最大的那个 page**
+
+代入 iquest（25 full + 63 sliding，每层 128 token × 1 head × 128 dim × K/V × bf16 = 64KB）：
+
+| | 现状（1 组） | hybrid 2 组（block 128，bf16） |
+|---|---|---|
+| bytes_per_block | 88 × 64KB = 5.5 MB | **max(25×64KB, 63×64KB) = 3.94 MB**（被滑窗组钉住） |
+| num_blocks | ~8,400 | ~12,440 |
+| full 组每请求占块 | 500 | 500 |
+| sliding 组每请求占块 | 500 | **32**（4096 窗口） |
+| **有效并发** | **16.8**（实测 16 ✓） | **min(12,440/500, 12,440/32) = 24.9** |
+
+⇒ hybrid 单独开 = **1.48×**（≈3,300 tok/s/卡），**不是 3×**。
+根因：滑窗组占 72% 的层数，把 bytes_per_block 顶到 3.94 MB，但每个请求在滑窗组只占
+32/12,440 个 block —— **约 93% 的滑窗组分配闲置**。
+
+**连带结论**：
+1. "每请求 KV 0.95 GB → 48 并发"的外推作废（共享池 + 每块成本取最大组）。
+2. **KV-C8 只落 25 个 full 层可能一个并发都提不了**：num_blocks 由被钉住的
+   bytes_per_block 决定；且 C8 的 per-layer page 若小于滑窗层 64KB，会被
+   `unify_kv_cache_spec_page_size` **补齐回 64KB** ⇒ 省显存效果被抵消。
+   **真正的杠杆是 full 组 `block_size` 512**（每请求占块 500 → 125）。
+3. 若最终只到 ~25 并发，则真正的解法是**把 63 个滑窗层也 C8 化**（压低
+   bytes_per_block），但 `attention_c8_mxfp.py:766-767` 明确不支持滑窗 ⇒ 最大未解风险。
+
+**⇒ S1 第一件事：量 `NPU KV cache size` 与 `Maximum concurrency`，用实测重定目标。**
+
 
 ---
 
