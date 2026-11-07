@@ -48,6 +48,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
+from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -402,6 +403,17 @@ class IQuestQ1Attention(nn.Module):
         else:
             self.k_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # [L5 perf] Optional Triton strided per-head QK-norm (additional_config
+        # "enable_iquest_triton_qk_norm"): reads q/k straight out of the fused
+        # QKV buffer instead of materializing contiguous head views for
+        # npu_rms_norm. Needs a power-of-two head_dim for tl.arange; the
+        # cross-KV path has no k_norm and stays on the reference route.
+        self.use_triton_qk_norm = bool(
+            get_ascend_config().enable_iquest_triton_qk_norm
+        ) and self.k_norm is not None and (
+            self.head_dim & (self.head_dim - 1) == 0 and self.head_dim >= 16
+        )
+
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
         attn_cls: type[nn.Module] = Attention
         sink_args = {}
@@ -453,17 +465,30 @@ class IQuestQ1Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-
-        if self.cross_kv_cache:
-            if self.rotary_emb is not None:
-                q, _ = self.rotary_emb(positions, q, None)
-            attn_output = self.attn(q, None, None)
+        if self.use_triton_qk_norm:
+            # Fused strided per-head QK-norm: one Triton launch covers the q
+            # and k rows of the fused QKV buffer with no contiguous copies.
+            # v keeps its strided view exactly like the reference path.
+            q, k = strided_qk_norm(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+            )
+            v = qkv[:, self.q_size + self.kv_size :]
         else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+
+        if not self.cross_kv_cache and not self.use_triton_qk_norm:
+            # Reference path: k is still the raw projection slice here.
+            # (The Triton path above already returned a normalized k.)
             k_by_head = k.view(
                 *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
             )
@@ -471,6 +496,11 @@ class IQuestQ1Attention(nn.Module):
             k_by_head = self.k_norm(k_by_head)
             k = k_by_head.view(k.shape)
 
+        if self.cross_kv_cache:
+            if self.rotary_emb is not None:
+                q, _ = self.rotary_emb(positions, q, None)
+            attn_output = self.attn(q, None, None)
+        else:
             if self.rotary_emb:
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
