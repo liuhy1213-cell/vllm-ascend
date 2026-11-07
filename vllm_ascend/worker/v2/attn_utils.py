@@ -972,6 +972,46 @@ def _uses_single_raw_mla_cache(
     return supports_strided_mla_cache(vllm_config, attn_module, kv_cache_spec)
 
 
+def can_overlay_attention_kv_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: Sequence[Any],
+) -> bool:
+    """Whether attention-only hybrid groups can overlay one shared backing.
+
+    vLLM costs one block as the largest group's pages and hands every group a
+    descriptor of ``bytes_per_block * num_blocks`` that aliases from byte 0 —
+    a block ID belongs to one group at a time. With a layer-outer, block-compact
+    layout each layer's pages are therefore a contiguous run inside that
+    backing, so one allocation serves every group.
+
+    Without this the allocator materializes one private buffer per layer
+    (``num_blocks * page_size`` each) and the planner has to shrink the budget
+    by ``largest_group / sum_of_all_layers``, i.e. the hybrid split buys no
+    extra blocks at all. Keep the predicate narrow: plain bf16/fp16
+    full + sliding window attention only, matching what the allocation path in
+    ``_allocate_kv_cache`` can materialize.
+    """
+    if len(kv_cache_groups) < 2:
+        return False
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if not (layout.is_layer_compact and layout.is_block_compact):
+        return False
+    specs: list[KVCacheSpec] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            specs.extend(group_spec.kv_cache_specs.values())
+        else:
+            specs.append(group_spec)
+    if not specs or any(type(spec) not in (FullAttentionSpec, SlidingWindowSpec) for spec in specs):
+        return False
+    if len({spec.page_size_bytes for spec in specs}) != 1:
+        # Different page sizes need the upstream padding machinery; keep them
+        # on the per-layer allocation path.
+        return False
+    return all(spec.dtype in (torch.float16, torch.bfloat16) for spec in specs)
+
+
 def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable[KVCacheSpec]) -> bool:
     """Keep Gemma 4's budget and the V2 runner on the same dense layout.
 
@@ -1108,7 +1148,13 @@ def _allocate_kv_cache(
         return kv_cache_raw_tensors
     has_mamba = any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())
     has_attention = any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
-    use_hybrid_layout = has_mamba and has_attention
+    # Attention-only hybrid (full + sliding-window groups) overlays one shared
+    # backing exactly like the Attention/Mamba mix: a block ID belongs to one
+    # group at a time, so every group's descriptor aliases the same pool and
+    # each layer only needs a contiguous view into it.
+    use_hybrid_layout = has_attention and (
+        has_mamba or can_overlay_attention_kv_groups(vllm_config, kv_cache_config.kv_cache_groups)
+    )
     is_glm5_next = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_kv_cache_spec.values())
 
     # The restored DeepSeek-V4 planner on main computes capacity for one

@@ -21,9 +21,9 @@
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| S0 | 分支 + 基线固化 + 生产侧 EE1006 同步 | 🟡 分支/记录已建；基线复测与生产同步未做 |
-| S1 | 重新启用 hybrid KV cache manager（核心解锁） | ⬜ |
-| S2 | KV-C8（mxfp8 KV cache）落在 25 个 full 层 | ⬜ |
+| S0 | 分支 + 基线固化 + 生产侧 EE1006 同步 | 🟡 分支/记录已建；基线已复测（rate 0.7 = 2,201）；生产同步待用户授权 |
+| S1 | 重新启用 hybrid KV cache manager（核心解锁） | ✅ 2026-11-08：2,201→5,065 tok/s/卡（2.30×），SLA 内；修 3 处代码缺口 |
+| S2 | KV-C8（mxfp8 KV cache）落在 25 个 full 层 | 🟡 滑窗算子探针完成（§3 S2-A：D 侧 decode GO）；实现未开始 |
 | S3 | D 侧步进优化 | ⬜ |
 | S4 | W4A4C8 权重 | ⬜ |
 | S5 | 精度闸门 + 长稳 + 回合主干 | ⬜ |
@@ -144,7 +144,8 @@ worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
    比值抵消 ⇒ 并发与 block size 无关。
 4. **只把 25 个 full 层 C8 化 = 零增益**（bytes_per_block 由 63 层滑窗组决定）。
    真杠杆是**让 63 个滑窗层也 C8**（2.8×），但 `attention_c8_mxfp.py:766-767`
-   明确不支持滑窗 attention ⇒ **本计划最大的技术阻塞项**。
+   明确不支持滑窗 attention ⇒ **本计划最大的技术阻塞项**
+   （算子探针已给出解法，见 §3 S2-A：D 侧 decode 走"窗口即视图"可绕开 mode4）。
 
 **⇒ S1 第一件事：量 `NPU KV cache size`（期望 1,074,944 → ~1.52M，**不是 3.2M**）
 与 `Maximum concurrency`（8.20x → ~11.9x），用实测重定目标。**
@@ -196,6 +197,118 @@ worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
    运行时是否正确寻址（这是唯一可能真要改模型/attention 代码的地方）。
 
 
+### 3.2 S1 上机实录（2026-11-08）
+
+**假设**：去掉 `--disable-hybrid-kv-cache-manager` 后，63 个滑窗层只保留窗口内 KV，
+D 侧可用 token 数应显著上升（按共享 block 池算式，理想值见 §2.6）。
+
+**改动**（部署侧，`deploy/iquest-1p1d-2m-mooncake-new78`）：
+
+| 文件 | 改动 |
+|---|---|
+| `serve_cmd.sh` | 两处 `--disable-hybrid-kv-cache-manager` 改为 `HYBRID_KV_MANAGER=1` 时不加（默认 0 保回退） |
+| `serve_cmd.sh` | P 侧前缀缓存与池化解耦：新增 `PREFILL_PREFIX_CACHING`（默认 1）。原因：池只贡献 1.7% 命中、HBM 前缀缓存贡献 94%，关池时若连 HBM 缓存一起关掉，每请求 prefill 从 6.4k 涨到 64k，会把结论污染 |
+| `env.sh` | `HYBRID_KV_MANAGER=1`、`PREFILL_PREFIX_CACHING=1`、`SFS_REPO→vllm-ascend-pd`、`PREFILL_MAX_NUM_SEQS 16→48`、`PREFILL_MAX_NUM_BATCHED_TOKENS 4096→8192`、`PREFILL_GPU_MEM_UTIL 0.90→0.94` |
+| `env.pool.override.sh` | 删除（`ENABLE_KV_POOL=0`，计划 §计划自检 问题 4） |
+| `correctness_gate.sh` / `measure_round.sh` | 新增：首 token/logprobs 一致性闸门、单轮测量汇总 |
+
+**代码改动**（分支 `perf/iquest-pd-hybrid-kv-20261108`）：见 §3.3，两处都是
+**hybrid 打开后才暴露的既有缺口**，不是优化代码。
+
+**测量**：见 §4。
+
+---
+
+### 3.3 S1 暴露的三个代码缺口（generic hybrid 从未被跑过）
+
+#### 缺口 1：`MooncakeHybridConnector.register_kv_caches` 无 generic hybrid 分支
+
+现象（D 侧首次以 hybrid 启动，`logs/archive/...`）：
+
+```
+File ".../mooncake_hybrid_connector.py", line 1907, in register_kv_caches
+    raise TypeError("Mooncake connector does not support this type kv_cache now.")
+```
+
+原因：该函数的分支链只有 three 条 —— `not use_hybrid`（普通 GQA）、`use_mamba`、
+`use_compress`（DeepSeek-V4 共享页）。**普通 GQA 的 full+sliding 多组布局没有任何分支**，
+说明这条路径此前只有 Mamba / DSV4 模型走过。
+
+修法：抽出 `_layer_kv_regions()`（把原 non-hybrid 的 K/V 交错 span / 独立张量逻辑共用），
+新增 `elif self.use_hybrid:` 分支：按层登记 `kv_caches_base_addr` / `block_len_per_addr`，
+并填 `addr_group_idx`（每个地址属于哪个 KV 组 —— hybrid 传输循环靠它筛组，
+留空会把每层数据复制到每个组），最后 `block_stride_per_addr = block_len_per_addr`。
+MTP draft 只在 D 侧存在且登记在末尾，传输循环的 `zip` 以短边为准自然丢弃。
+
+#### 缺口 2：Ascend 多组 KV 预算被按「每层私有 buffer」缩放（hybrid 零收益的直接原因）
+
+现象（hybrid 打开后 D 侧启动日志）：
+
+```
+WARNING [kv_cache_utils.py:1556] Add 15 padding layers, may waste at most 23.81% KV cache memory
+INFO    [worker.py:751] Ascend per-layer KV layout scales the multi-group budget by 0.2921
+        (1703936 bytes/block over 5832704 total page bytes) so per-layer buffers fit within device memory.
+INFO    NPU KV cache size: 940,002 tokens, Maximum concurrency 7.17x
+```
+
+即：**hybrid 打开后可用 KV 反而从 1,074,944 掉到 940,002 tokens**（−12.6%），
+比 baseline 更差。
+
+机制（读码 + 日志数字互相印证）：
+
+1. vLLM 的 hybrid 分组是「按类型分桶 → 每桶切成 group_size 层一组」，iquest 是
+   **4 组**：full 26 层（25 + MTP draft）/ sliding 21+21+21 层。
+   `bytes_per_block = max(组内层数) × page = 26 × 64KB = 1,703,936 B`（与日志数字一致）。
+2. 每个组的 `KVCacheTensor.size` 都等于 `bytes_per_block × num_blocks`，且**四组都从
+   byte 0 别名同一块 backing**（`kv_cache_utils.py:1759` 的注释图）。一个 block id
+   同一时刻只属于一个组，所以物理上只需要一份池。
+3. Ascend 的 `_allocate_kv_cache` 只在 `use_hybrid_layout = has_mamba and has_attention`
+   时启用 `hybrid_backing` 单一 backing；**attention-only 的 hybrid 走不到**，
+   于是退化成「每层一个私有 buffer」（`num_blocks × page_size` 各一份），
+   总占用 = `num_blocks × Σ所有层 page = 5,832,704 B/block`，
+   是 vLLM 记账的 3.42 倍 ⇒ worker 端的预算预缩放（0.2921）只是在补偿这个退化布局，
+   hybrid 省下的内存全部被浪费掉。
+
+修法（两处必须同时改，否则不是 OOM 就是白省）：
+
+| 文件 | 改动 |
+|---|---|
+| `vllm_ascend/worker/v2/attn_utils.py` | 新增 `can_overlay_attention_kv_groups()` 判定；`_allocate_kv_cache` 的 `use_hybrid_layout` 改为 `has_attention and (has_mamba or can_overlay_attention_kv_groups(...))`，让 attention-only hybrid 也走单一 backing + 每层连续视图 |
+| `vllm_ascend/worker/worker.py` | `get_available_kv_cache_memory` 的免缩放分支加入 `overlays_attention_groups`（同一判定），不再乘 0.2921 |
+
+判定条件刻意收窄：≥2 组、`LBNHC`（layer-outer + block-compact，日志
+`Using LBNHC KV cache layout`）、全是 bf16/fp16 的 `FullAttentionSpec`/`SlidingWindowSpec`、
+各组 `page_size_bytes` 相同。分配路径对 `layer_stride/block_stride` 有 assert，
+不满足会直接报错而不是静默错位。
+
+#### 缺口 3：overlay 布局下「按 base_addr 去重」会静默丢掉整组滑窗层（我自己引入的 bug）
+
+现象（首次以 overlay 布局跑通后）：容量数字全对（D 3.2M tokens），但
+**P 直连与走 proxy 的首 token 分布完全不同**（P 给 `<think>`（lp≈-1.8e-5），
+proxy 给 ` j`（lp≈-2.18）），且**非确定性**（同一 prompt 5 次里 1 次对）。
+
+定位过程（三段对照，不需要改代码）：
+1. P 直连 vs **D 直连**（D 自己算 prefill）→ 首 token logprob 一致到 1e-4
+   ⇒ 模型/分组/attention 本身没问题。
+2. P 直连 vs proxy（走传输）→ 首 token 分布差几个 nat ⇒ 传输路径有问题。
+3. 引擎日志：两侧 `Registering interleaved KV span` 各 88/89 条（层数对），
+   但按 group 过滤后传的是 25/26 层。
+
+根因：overlay 布局下**不同组的层共用同一段物理槽位**（组 0 的 layer j 与组 1 的
+layer j 地址完全相同）。我在 hybrid 分支里加了「同一 base_addr 只登记一次」的去重，
+于是 63 个滑窗层全部被当成「KV 共享」跳过 ⇒ **滑窗组从来没被传输过**，
+D 侧滑窗 KV 是前一个请求的残留 ⇒ 输出随残留内容漂移（解释了非确定性）。
+修正：hybrid 分支不做去重 —— 每个层保留自己的地址条目；block id 同一时刻只属于
+一个组，各组的块从各自层的槽位寻址，物理重叠是设计本身。
+（物理内存注册仍由 `collect_configured_register_regions` 按 storage 去重，不受影响。）
+
+**正确性判据的教训**：不能拿 greedy 文本相等当闸门 —— 两个引擎 batch/内核不同，
+`<think>` 之后两个常见开头 logprob 只差 0.02~0.03，会自然翻转。
+改用「P 的 top-1 token 落到 D 的 top-5 且 |Δlogprob| ≤ 0.1 nat」
+（`correctness_gate.sh`，多档 prompt 长度）。
+
+---
+
 ### S1 重新启用 hybrid KV cache manager
 
 - **改哪**：`serve_cmd.sh` 两处 `--disable-hybrid-kv-cache-manager` 改为可关
@@ -227,6 +340,63 @@ worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
   **不含 `"MooncakeHybridConnector"`** ⇒ 需加白名单。
 - **其它**：MTP draft 的 C8 归属、block size 对齐、图模式兼容、sink 精度复测。
 
+### S2-A 算子探针：C8-QFA 滑窗能力 go/no-go（2026-11-08，docs-only）
+
+**假设**：63 滑窗层 C8 是唯一 2.8× 并发杠杆（§2.6），阻塞在
+`attention_c8_mxfp.py:766-767` 的滑窗 NotImplementedError。先探 CANN 9.2.1
+`quant_flash_attn`（QFA）能否原生支持滑窗（mask_mode=4 / win_left），探针不过则
+永久关闭这条线。
+
+**改动**：零代码改动。容器 `iquest-pd-p`（CANN 9.2.1，与引擎同款）直调 QFA op，
+6 轮探针（`/tmp/c8_swa_probe*.py`）。缓存按引擎同款 packet 几何构造
+（`mxfp_paged_cache_views`：物理顺序 **K|K_scale|V|V_scale**，PITCH=33792，
+K_BYTES=16384、S_BYTES=512），layout_q=TND / layout_kv=PA_NZ / layout_out=TND、
+q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` 调用
+逐参对齐。V payload 用单调编码（V[block][row]=16·block+1+row/16，一个 token 的
+128 个 dim 同值）让输出直接反读被注意的 token 集合——自一致方法，无需参考实现。
+
+**测量**（T=1 除另注；输出按 e4m3 量化格点解码）：
+
+| 探针 | 配置 | 结果 |
+|---|---|---|
+| mode4 直路 | quant_mode=1 + mask_mode=4（win_left=1e5 / 15） | ❌ tiling 硬拒："Current quant_mode only supports mask_mode 0 (NO_MASK) and 3 (CAUSAL), SLIDING_WINDOW(4) is not supported" |
+| R0 多块正确性 | mode0，4-block 表，seqused=500 | ✅ out=28.5 ≈ 全 500 token 理论值 28.31；LSE=6.221≈ln(500)；全 1 控制组 out=1.0000（归一化精确） |
+| R1 尾窗字节一致 | mode0，独立 16-token 缓存（=500 缓存尾部逐字节拷贝） | ✅ out=56.0=尾部内容（b3 rows116..127 的编码值） |
+| **R2/R4 窗口即视图** | mode0，**block_table 首条目=窗口起始块 + seqused=16**（不复制缓存） | ✅ R2=48.0（b3 rows0..15）、R4=17.875（b1 rows0..15）——语义：从 block_table 首条目的 row 0 起读 seqused 个 token |
+| 显式 mask | mode0+mask ❌（"When mask_mode is 0 (NO_MASK), attn_mask should not be provided"）；mode3+mask[6,16]/[6,2048]/bool ❌；**mode3+int8[2048,2048] ✅** | N1 正控：语义=mask[**绝对 q 位置**, 视图相对 kv 列]，全 1 行=不 mask，带状掩码输出逐行吻合理论（2.25..2.875） |
+| quant_mode 枚举 | metadata op 实测 | 仅 {0=HIF8, 1=MXFP8, 6=QK/V 分离 FP8}；**mode5(MXFP4) 不存在**（wrapper 枚举有、C++ 拒） |
+
+**结论：GO（限定 D 侧 decode）**。
+1. mode4 直路 NO-GO——kernel tiling 拒绝，"枚举声明≠实现"。
+2. 显式 mask 路径 NO-GO——mode0 禁 mask；mode3 的 [2048,2048] 定格网格装不下
+   iquest W=4096 窗口（视图截半），且行索引=绝对 q 位置，>2048 序列不可用。
+3. **GO 路线 = 窗口即视图（window-as-view）**：滑窗层 decode 时传"平移+裁剪的
+   block_table（首条目=窗口起始块）+ seqused_kv=窗口长"，mode0 无 mask，算子级
+   精确（R1/R2/R4 逐字节验证，R0/R3 多块正确）。**1P1D 的 D 侧是纯 decode，
+   恰好覆盖瓶颈侧** ⇒ §2.6 的 2.8× 杠杆在算子层无阻塞。
+4. 引擎侧待办（设计问题，非算子问题）：①AscendMetadata 单份 block_tables，需让
+   滑窗组拿到平移视图（= §3.1 未知项 c）；②MooncakeHybridConnector 白名单
+   （de03e3845 已做）；③MTP verify（T≤6）滑窗层三选一：mode0 视图多看 ≤5 个
+   本步 draft token（泄漏有界）/ mode3 mask 视图截半 / 滑窗层退 T=1 逐 token，
+   S2 实现时定；④**P 侧 prefill（T>1+滑窗）无精确算子路径**，P 侧滑窗层维持
+   现状（P 非瓶颈，§2.2）。
+5. S4/W4A4C8 关联：QFA 无 MXFP4 模式 ⇒ attention 恒 W8A8（配方本就如此），
+   S4 无算子阻塞也无 attention 侧收益。
+
+**回滚开关**：不适用（纯探针；S2 实现的开关随实现另记）。
+
+**踩到的坑**：
+1. packet 物理顺序是 **K|K_scale|V|V_scale**（K_scale@16384、V@16896）——把
+   scale 字节（0x7F=e4m3 NaN）填进 V payload 会经 softmax 污染整行输出
+   （v2/v3 探针 NaN 根因）。未写 slot 一律 0x00。
+2. 探针输出是 **e4m3 量化值的凸组合**：[32,64) ULP=4、[16,32) ULP=2——读数按
+   量化格点解码，别当精确均值。
+3. `max_seqlen_kv=-1` 不裁剪注意力范围（mskv=128 仍全量注意 500 token）。
+4. mode3 的 attn_mask 形状硬性 [2048,2048] int8（与 max_seqlen 无关）；
+   行=绝对 q 位置、列=视图相对 kv 索引；全 1 行按不 mask 处理。
+5. `quant_mode=5` 在 wrapper 枚举里存在但 C++ 只收 {0,1,6}——与 mask_mode=4
+   同一教训：**接口声明≠算子实现，必须运行时探**。
+
 ### S3 D 侧步进
 
 1. `-prof` 已有但 new78 未开的两项：`enable_fused_o_proj_ar`、`enable_iquest_triton_qk_norm`。
@@ -257,14 +427,47 @@ worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
 
 | 阶段 | 配置 | 并发/rate | total/16 | mTPOT | p99 TTFT | 备注 |
 |---|---|---|---|---|---|---|
-| 基线 | new78 原样（-opt@d8a436033） | rate 0.7 | **2,201** | 16.35 ms | 1.55 s | `logs/bench/pd_open07r1.json` |
+| 基线 | new78 原样（-opt@d8a436033，hybrid off） | rate 0.7 | **2,201** | 16.35 ms | 1.55 s | `logs/bench/pd_open07r1.json` |
 | 基线 | 同上 | c24 | 3,312 | 17.16 ms | 24.18 s ❌ | `pd_c24r1.json` |
 | 基线 | 同上 | c48 | 3,270 | 17.33 ms | 45.81 s ❌ | `pd_c48r1.json` |
 | | | | | | | |
-| S1 | hybrid KV + 两侧同时 | | | | | 待测 |
+| **S1** | hybrid KV + 池化关闭（两侧同切 -pd） | rate 0.9 | **2,964** | 15.83 ms | 2.39 s | `pd_s1_open09r1.json`（max_conc 23） |
+| **S1** | 同上 | rate 1.2 | 3,700 | 17.70 ms | 3.00 s | `pd_s1_open12r1.json`（max_conc 34） |
+| **S1** | 同上 | rate 1.6 | 4,634 / 4,606 | 21.95 / 22.35 ms | 2.66 / 2.70 s | `pd_s1_open16r{1,2}.json`（max_conc 49） |
+| **S1** | 同上 | rate 1.8 | 5,008 / 5,122 | 21.90 / 21.88 ms | 3.64 / 3.22 s | `pd_s1_open18r{1,2}.json`（max_conc 53/54）|
+| **S1** | 同上 | rate 2.0 | 5,413 | 23.26 ms | **8.90 s ❌** | `pd_s1_open20r1.json`（max_conc 打满 64） |
+| **基线(A/B)** | 同树 `-pd`，hybrid **off** | rate 0.7 | **2,243** | 16.31 ms | 2.40 s | `pd_base_open07r1.json`（max_conc 18） |
+| **基线(A/B)** | 同上 | rate 0.9 | 2,668 | 16.39 ms | **7.62 s ❌** | `pd_base_open09r1.json`（超容量） |
+| **基线(A/B)** | 同上 | rate 1.8 | 3,289 | 17.15 ms | **49.6 s ❌** | `pd_base_open18r1.json`（排队到 64，KV 打满） |
 | S2 | + KV-C8 | | | | | 待测 |
 | S3 | + 步进优化 | | | | | 待测 |
 | S4 | W4A4C8 | | | | | 待测 |
+
+**S1 结论（2026-11-08）**
+
+- **容量**：D 侧 `NPU KV cache size` 1,074,944 → **3,217,812 tokens（2.99×）**，
+  `Maximum concurrency (131,072)` 8.20x → **24.55x**；P 侧 1,020,160 → **2,630,224（2.58×）**。
+  比计划 §2.6 估算的 1.52M 高得多 —— 原因是 vLLM 会把 sliding 桶切成 3 组（26/21/21/21），
+  `bytes_per_block` 由 full 组 26 层钉住（1.70 MB），滑窗组只按 21 层计价，
+  每请求 500 + 3×32 = 596 block（比计划的 532 略多但每块更小）。
+- **SLA 内的最大吞吐：rate 1.8 → median 5,065 tok/s/卡（2.30×）**，
+  TPOT 21.9 ms（≤25 ✓）、p99 TTFT 3.2–3.6 s（≤4 ✓）；再往上（rate 2.0）TTFT 破 8.9 s。
+  收益低于线性（并发 2.7× → 吞吐 2.3×）：batch 变大后 TPOT 从 16.4 → 21.9 ms，
+  MTP accept 从 ~3.7 降到 2.3–2.6 —— 正是计划 §P2 预警的"新工作点必须重测 accept"。
+- **吞吐公式核对**：并发 53 × (1+accept 2.4 换算) / step。实测 step ≈ 22 ms × 2.4 ≈ 53 ms
+  仍高于 baseline 的 ~60 ms 一点点改善，但 accept 掉 1.3 抵消了。
+  ⇒ 下一步的最大杠杆变成 S3（降 step）与 accept 恢复，而不是继续堆并发。
+- **防假绿**：`Running` 真实升到 53/54；`NPU KV cache usage` 峰值 92.4%（不再是 96% 打满）；
+  preempt/OOM/abort 全 0；prefix 命中口径未变（P 侧仍开 HBM 前缀缓存，池化已关）。
+  MTP accept 2.31–2.63（未塌到 1.x）。
+- **同树 A/B（hybrid off，其余配置完全一致）**：SLA 内最大吞吐 **2,243**（rate 0.7）；
+  rate 0.9 时 p99 TTFT 已破到 7.6 s、rate 1.8 时 49.6 s ⇒ baseline 的可用工作点只有 rate ~0.7。
+  ⇒ **SLA 内吞吐 2,243 → 5,065（2.26×）**，不是靠放开并发换来的假收益（两侧同一份代码、
+  同一份部署参数、同一把度量）。
+- **精度**：GSM8K-100 经 PD proxy（P prefill → hybrid KV 传输 → D decode）**95/100**，
+  5 条截断、0 错误 —— 与 `-opt` 栈基线画像（94–95 + 3–4 截断）一致。
+- **正确性闸门**：`correctness_gate.sh` 5 档 prompt 长度（50/200/600/1200/3000 词）
+  首 token logprob 与 P 直连偏差 **≤ 0.0004 nat**（判据 0.1）。
 
 ### 精度记录
 
@@ -297,6 +500,18 @@ worktree：`/mnt/sfs_turbo/work/chensq/infer/iq-vllm-bf16/vllm-ascend-pd`。
     `pkill -f 'vllm'` 会误杀 proxy（proxy 路径含 "vllm"）。
 11. **open-loop 口径与 closed-loop 的表观收益可差 2.6×**（排队复利）⇒
     选对口径才能看到真实收益。
+12. **`mooncake_hybrid_connector.py` 里的 `envs` 是 `vllm.envs`**；
+    需要 vllm_ascend 的环境变量时必须 `from vllm_ascend import envs as ascend_envs`。
+    写成 `from vllm_ascend import envs` 会静默遮蔽 `vllm.envs`，症状是
+    `AttributeError: module 'vllm_ascend.envs' has no attribute 'VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT'`
+    在 `get_finished` 里才炸，并伴随 `malloc(): unsorted double linked list corrupted`
+    （进程带着异常继续跑了一段才崩，容易误判成显存/驱动问题）。
+13. **deploy 脚本必须在对应节点上执行**：`bash start.sh start proxy` 在别的机器上跑会
+    `docker exec` 到本地同名容器（不存在）或探到本机 127.0.0.1:1999 的其它服务，
+    打印"proxy 就绪"但实际没起。代理/引擎探活一律打**对端 IP**，不要用 127.0.0.1。
+14. **正确性闸门不能用 greedy 文本相等**：不同引擎/内核在近并列位置会翻转
+    （`<think>` 之后两个开头 logprob 差 0.02–0.03）；用"P 的 top-1 token 落在 D 的 top-5
+    且 |Δlogprob| ≤ 0.1 nat"判据（`correctness_gate.sh`）。KV 错位时 Δ 会是 2–3 nat。
 
 ---
 

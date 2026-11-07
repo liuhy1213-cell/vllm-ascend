@@ -5,6 +5,7 @@ import math
 import os
 import queue
 import random
+import re
 import struct
 import threading
 import time
@@ -52,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
@@ -824,6 +826,22 @@ class KVCacheRecvingThread(threading.Thread):
                 ret,
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+        if ascend_envs.VLLM_ASCEND_DEBUG_HYBRID_XFER:
+            logger.info(
+                "HYBRID-XFER req=%s groups=%d addrs=%d per_group_addrs=%s remote_blocks=%s local_blocks=%s "
+                "srcs=%d lens=%s",
+                remote_request_id,
+                self.hma_group_size,
+                len(local_addrs),
+                [
+                    sum(1 for kk in range(len(local_addrs)) if not addr_group_arr or i in addr_group_arr[kk])
+                    for i in range(self.hma_group_size)
+                ],
+                [len(b) for b in remote_block_ids],
+                [len(b) for b in local_block_ids],
+                len(src_list),
+                sorted({ln for ln in length_list})[:4],
+            )
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -1776,6 +1794,91 @@ class MooncakeConnectorWorker:
         assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
 
+    def _layer_kv_regions(self, layer_name: str, kv_cache_tuple: Any) -> list[tuple[int, int, tuple[int, int]]]:
+        """Resolve one layer's KV cache into transfer addresses and regions.
+
+        Returns ``[(base_addr, block_len, (register_ptr, register_len)), ...]``:
+
+        * one entry per layer for a single standalone tensor;
+        * one entry for the whole covering span when K/V are strided views of
+          one ``[blocks, 2, tokens, h, d]`` buffer (V sits one K-page into it).
+          The views overlap and the transfer engine rejects overlapping
+          regions, so the span is registered once — a page is the contiguous
+          ``[K_b | V_b]`` slice, hence ``base + block_id * page_len`` addresses
+          exactly the bytes the per-view math would, on both sides;
+        * one entry per tensor for disjoint contiguous allocations.
+
+        Shared by the uniform (single-group) and generic hybrid layouts.
+        """
+        if isinstance(kv_cache_tuple, (list, tuple)) is False:
+            kv_cache_tuple = [kv_cache_tuple]
+        tensors = sorted(kv_cache_tuple, key=lambda t: t.data_ptr())
+        entries: list[tuple[int, int, tuple[int, int]]] = []
+        if len(tensors) == 1:
+            single_kv_cache = tensors[0]
+            tensor_num_blocks = single_kv_cache.shape[0]
+            block_size_scale = tensor_num_blocks // self.num_blocks
+            block_shape = single_kv_cache.shape[1:]
+            entries.append(
+                (
+                    single_kv_cache.data_ptr(),
+                    single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale,
+                    (
+                        single_kv_cache.data_ptr(),
+                        single_kv_cache.element_size() * math.prod(single_kv_cache.shape),
+                    ),
+                )
+            )
+            return entries
+        first, second = tensors
+        k_page = first.element_size() * math.prod(first.shape[1:])
+        page_len = 2 * k_page
+        interleave_stride = first.stride(0) * first.element_size()
+        if (
+            second.data_ptr() - first.data_ptr() == k_page
+            and interleave_stride == page_len
+            and second.stride(0) == first.stride(0)
+        ):
+            span = page_len * first.shape[0]
+            if span % self.num_blocks != 0:
+                raise ValueError(
+                    f"Interleaved KV span for {layer_name} ({span} B) is not "
+                    f"divisible by num_blocks ({self.num_blocks})."
+                )
+            logger.info(
+                "Registering interleaved KV span for %s: base=0x%x page=%d B x %d blocks",
+                layer_name,
+                first.data_ptr(),
+                page_len,
+                first.shape[0],
+            )
+            entries.append((first.data_ptr(), page_len, (first.data_ptr(), span)))
+            return entries
+        # Disjoint contiguous allocations: register each tensor as its own region.
+        for single_kv_cache in tensors:
+            tensor_num_blocks = single_kv_cache.shape[0]
+            block_size_scale = tensor_num_blocks // self.num_blocks
+            block_shape = single_kv_cache.shape[1:]
+            entries.append(
+                (
+                    single_kv_cache.data_ptr(),
+                    single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale,
+                    (
+                        single_kv_cache.data_ptr(),
+                        single_kv_cache.element_size() * math.prod(single_kv_cache.shape),
+                    ),
+                )
+            )
+        return entries
+
+    def _record_layer_kv_regions(self, layer_name: str, kv_cache_tuple: Any) -> list[tuple[int, int]]:
+        """Append one layer's addresses to the transfer metadata; return register regions."""
+        entries = self._layer_kv_regions(layer_name, kv_cache_tuple)
+        for base_addr, block_len, _ in entries:
+            self.kv_caches_base_addr.append(base_addr)
+            self.block_len_per_addr.append(block_len)
+        return [region for _, _, region in entries]
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
         self.use_mla = self.vllm_config.model_config.is_deepseek_mla
@@ -1792,67 +1895,9 @@ class MooncakeConnectorWorker:
         lengths = []
         if not self.use_hybrid:
             for layer_name, kv_cache_tuple in kv_caches.items():
-                if isinstance(kv_cache_tuple, (list, tuple)) is False:
-                    kv_cache_tuple = [kv_cache_tuple]
-                tensors = sorted(kv_cache_tuple, key=lambda t: t.data_ptr())
-                if len(tensors) == 1:
-                    single_kv_cache = tensors[0]
-                    tensor_num_blocks = single_kv_cache.shape[0]
-                    block_size_scale = tensor_num_blocks // self.num_blocks
-                    block_shape = single_kv_cache.shape[1:]
-                    self.block_len_per_addr.append(
-                        single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
-                    )
-                    self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
-                    ptrs.append(single_kv_cache.data_ptr())
-                    lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
-                    continue
-                first, second = tensors
-                k_page = first.element_size() * math.prod(first.shape[1:])
-                page_len = 2 * k_page
-                interleave_stride = first.stride(0) * first.element_size()
-                if (
-                    second.data_ptr() - first.data_ptr() == k_page
-                    and interleave_stride == page_len
-                    and second.stride(0) == first.stride(0)
-                ):
-                    # K/V are strided views of one [blocks, 2, tokens, h, d]
-                    # buffer (V sits one K-page into it): the views overlap
-                    # and the transfer engine rejects overlapping regions.
-                    # Register the covering span once instead — a page is the
-                    # contiguous [K_b | V_b] slice, so base + block_id *
-                    # page_len addresses exactly the bytes the per-view math
-                    # would, on both the producer and the consumer side.
-                    span = page_len * first.shape[0]
-                    if span % self.num_blocks != 0:
-                        raise ValueError(
-                            f"Interleaved KV span for {layer_name} ({span} B) is not "
-                            f"divisible by num_blocks ({self.num_blocks})."
-                        )
-                    logger.info(
-                        "Registering interleaved KV span for %s: base=0x%x page=%d B x %d blocks",
-                        layer_name,
-                        first.data_ptr(),
-                        page_len,
-                        first.shape[0],
-                    )
-                    self.kv_caches_base_addr.append(first.data_ptr())
-                    self.block_len_per_addr.append(page_len)
-                    ptrs.append(first.data_ptr())
-                    lengths.append(span)
-                else:
-                    # Disjoint contiguous allocations: register each tensor
-                    # as its own region (original behavior).
-                    for single_kv_cache in tensors:
-                        tensor_num_blocks = single_kv_cache.shape[0]
-                        block_size_scale = tensor_num_blocks // self.num_blocks
-                        block_shape = single_kv_cache.shape[1:]
-                        self.block_len_per_addr.append(
-                            single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
-                        )
-                        self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
-                        ptrs.append(single_kv_cache.data_ptr())
-                        lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
+                for ptr, length in self._record_layer_kv_regions(layer_name, kv_cache_tuple):
+                    ptrs.append(ptr)
+                    lengths.append(length)
         elif self.use_mamba:
             for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
                 for layer_name in get_kv_cache_tensor_layers(kv_cache_tensor):
@@ -1903,6 +1948,59 @@ class MooncakeConnectorWorker:
                 self.addr_group_idx.append(sorted(page_groups))
                 self.block_stride_per_addr.append(shared_page.block_stride)
                 self.block_len_per_addr.append(shared_page.block_stride)
+        elif self.use_hybrid:
+            # Generic multi-group hybrid layout (GQA full + sliding-window
+            # groups, no Mamba / no compressed indexer). Same per-layer
+            # addressing as the uniform layout — including the interleaved
+            # [K_b | V_b] span handling — plus the KV-cache group each address
+            # belongs to, which the hybrid transfer loop uses to select the
+            # matching per-group block ids.
+            #
+            # addr_group_idx stays local metadata (it is not exchanged in the
+            # handshake): producer and consumer run the same group layout. The
+            # MTP draft layer only exists on the decode side and is registered
+            # last, so the shorter-side zip in the transfer loop drops it.
+            layer_group_idx: dict[str, int] = {}
+            for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                for layer_name in group.layer_names:
+                    layer_group_idx[layer_name] = group_idx
+
+            def _layer_index(item: tuple[str, Any]) -> int:
+                match = re.search(r"\.layers\.(\d+)\.", item[0])
+                return int(match.group(1)) if match else 1 << 30
+
+            # Address lists are paired by position with the peer (the transfer
+            # loop zips them), so both sides must expose the same order. The
+            # runner hands kv_caches over group-major, and a draft layer inside
+            # the first group would shift every later index by one against the
+            # producer. Sort by model layer index instead: the draft layer has
+            # the highest index and ends up last, where the shorter-side zip
+            # drops it.
+            for layer_name, kv_cache_tuple in sorted(kv_caches.items(), key=_layer_index):
+                group_idx = layer_group_idx.get(layer_name)
+                if group_idx is None:
+                    raise ValueError(f"Layer {layer_name} is not assigned to any KV cache group.")
+                for base_addr, block_len, (ptr, length) in self._layer_kv_regions(layer_name, kv_cache_tuple):
+                    # Every layer keeps its own entry even when two groups alias
+                    # the same physical slot: a block ID belongs to one group at
+                    # a time, so group g's blocks are addressed from the slot its
+                    # own layer sits in. Dropping aliased entries would silently
+                    # stop transferring whole groups.
+                    self.kv_caches_base_addr.append(base_addr)
+                    self.block_len_per_addr.append(block_len)
+                    self.addr_group_idx.append([group_idx])
+                    ptrs.append(ptr)
+                    lengths.append(length)
+            # Every recorded region is one contiguous page, so the distance
+            # between consecutive blocks equals the block length.
+            self.block_stride_per_addr.extend(self.block_len_per_addr)
+            logger.info(
+                "Hybrid KV layout: %d groups, %d transfer addresses, per-group=%s, block_lens=%s",
+                len(self.kv_cache_config.kv_cache_groups),
+                len(self.kv_caches_base_addr),
+                [sum(1 for g in self.addr_group_idx if i in g) for i in range(len(self.kv_cache_config.kv_cache_groups))],
+                sorted(set(self.block_len_per_addr)),
+            )
         else:
             raise TypeError("Mooncake connector does not support this type kv_cache now.")
 

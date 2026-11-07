@@ -64,6 +64,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # The home path for CANN toolkit. If not set, the default value is
     # /usr/local/Ascend/ascend-toolkit/latest
     "ASCEND_HOME_PATH": lambda: os.getenv("ASCEND_HOME_PATH", None),
+    # Log one line per hybrid KV transfer (per-group block counts, address
+    # counts, transfer sizes) to diagnose producer/consumer group layout
+    # mismatches. Default: 0 (off). Valid values: 0 or 1. Not sensitive.
+    "VLLM_ASCEND_DEBUG_HYBRID_XFER": lambda: _strict_binary_env("VLLM_ASCEND_DEBUG_HYBRID_XFER"),
+
     # The path for HCCL library, it's used by pyhccl communicator backend. If
     # not set, the default value is libhccl.so.
     "HCCL_SO_PATH": lambda: os.getenv("HCCL_SO_PATH", None),

@@ -712,19 +712,29 @@ class NPUWorker(WorkerBase):
         model_runner = getattr(self, "model_runner", None)
         layout = self.vllm_config.cache_config.get_resolved_kv_cache_layout()
         shares_attention_pool = False
+        overlays_attention_groups = False
         if getattr(self, "use_v2_model_runner", False):
             # Load V2 helpers only for V2 workers; V1 retains private allocation
             # and must keep its original multi-group budget scaling.
-            from vllm_ascend.worker.v2.attn_utils import can_share_full_and_sliding_kv_cache
+            from vllm_ascend.worker.v2.attn_utils import (
+                can_overlay_attention_kv_groups,
+                can_share_full_and_sliding_kv_cache,
+            )
 
             shares_attention_pool = can_share_full_and_sliding_kv_cache(self.vllm_config, per_layer_specs)
+            # Attention-only hybrid (full + sliding window): the V2 allocator
+            # materializes each layer as a contiguous view into one shared
+            # backing, so the pool costs the largest group's pages per block —
+            # exactly what the planner already assumes. Scaling the budget down
+            # per layer here would throw the hybrid saving away.
+            overlays_attention_groups = can_overlay_attention_kv_groups(self.vllm_config, kv_cache_groups)
         # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
         # are, remove this is_step_model exemption: this line and the
         # `or is_step_model` budget gate below.
         is_step_model = self.model_config.hf_text_config.model_type in ("step3p5", "step3p7")
         if (
             has_attention
-            and (has_mamba or is_step_model or shares_attention_pool)
+            and (has_mamba or is_step_model or shares_attention_pool or overlays_attention_groups)
             and layout.is_layer_compact
             and layout.is_block_compact
             and getattr(model_runner, "supports_standardized_shared_kv_backing", False)
