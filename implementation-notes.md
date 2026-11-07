@@ -415,8 +415,22 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
 
 ### S4 W4A4C8
 
-切 `/mnt/sfs_turbo/models/IQuest-Q1-W4A4C8-mxfp4-20261107`（已跑通、冒烟过、GSM8K-100=96）。
-权重流 38.6 GB/卡 → ~20 GB/卡，decode 步长硬下限 ~26 ms → ~13 ms。
+切 `/mnt/sfs_turbo/models/IQuest-Q1-W4A4C8-mxfp4-20261107`（164 GB，19 分片）：
+`env.override.sh` 加一行 `MODEL_PATH=...`，`container.sh` 加一条只读挂载（要重建容器）。
+
+**2026-11-08 实测：全通，且是本次最大的单点收益。**
+
+- 加载 / ACL graph / eagle MTP / hybrid KV / PD 传输：全通，无报错。
+- KV 容量再涨：D 3,217,812 → **4,512,525 tokens**（权重变小，KV 预算变多）。
+- 正确性闸门（50/1200/3000 词）：Δlogprob ≤ 0.0003 nat，PASS。
+- **SLA 内吞吐：rate 2.2 → 6,388 tok/s/卡**（TPOT 20.8 ms、TTFT p99 3.01 s）；
+  rate 2.3 = 6,657 / 6,604，但 TTFT p99 3.07 / 4.21 抖动；rate 2.4 = 6,741 时 4.31 ❌。
+  同并发对比 W8A8C8：rate 1.8 下 TPOT 21.9 → 19.7 ms（−2.2 ms）；
+  真收益来自**能在 SLA 内多跑 ~0.4 req/s**。
+- **GSM8K-100 经 PD 全链路：96/100**（4 截断、0 错误），与 W4A4C8 单机基线一致，
+  高于 W8A8C8 的 95/100（噪声内）。
+- 回退：删掉 `env.override.sh` 里那行 `MODEL_PATH=` 即回到 W8A8C8（无需重建容器，
+  两个权重目录都已挂载）。
 
 ---
 
@@ -439,9 +453,12 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
 | **基线(A/B)** | 同树 `-pd`，hybrid **off** | rate 0.7 | **2,243** | 16.31 ms | 2.40 s | `pd_base_open07r1.json`（max_conc 18） |
 | **基线(A/B)** | 同上 | rate 0.9 | 2,668 | 16.39 ms | **7.62 s ❌** | `pd_base_open09r1.json`（超容量） |
 | **基线(A/B)** | 同上 | rate 1.8 | 3,289 | 17.15 ms | **49.6 s ❌** | `pd_base_open18r1.json`（排队到 64，KV 打满） |
-| S2 | + KV-C8 | | | | | 待测 |
-| S3 | + 步进优化 | | | | | 待测 |
-| S4 | W4A4C8 | | | | | 待测 |
+| **S3** | + 两个 -prof 开关（fused o_proj AR + Triton QK-norm） | rate 1.8 | 4,845 / 5,095 | 23.17 / 21.14 ms | 6.56 ❌ / 3.05 ✅ | 对照 5,008/5,122；**噪声内无收益**，默认关（`S3_EXTRA=0`） |
+| **S4** | W4A4C8 mxfp4 权重（hybrid 仍开） | rate 1.8 | 5,204 | 19.73 ms | 2.83 s | `pd_s4_open18r1.json` |
+| **S4** | 同上 | rate 2.0 | 5,862 | 21.90 ms | 3.07 s | `pd_s4_open20r1.json` |
+| **S4** | 同上 | rate 2.2 | **6,388** | 20.84 ms | 3.01 s | `pd_s4_open22r1.json`（SLA 内最好点） |
+| **S4** | 同上 | rate 2.3 | 6,657 / 6,604 | 22.88 / 22.46 ms | 3.07 ✅ / 4.21 ⚠ | `pd_s4_open23r{1,2}.json`（临界） |
+| **S4** | 同上 | rate 2.4 | 6,741 | 22.70 ms | **4.31 ❌** | `pd_s4_open24r1.json` |
 
 **S1 结论（2026-11-08）**
 
