@@ -111,6 +111,63 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         return random_sample(probs, generators), logits_to_return
 
 
+# On wide-vocab rows the full [T, V] ascending sort + cumsum is pathological on
+# NPU: aclnnCumsum scans each 160k-wide row serially (~31 GB/s on [120, 160000]
+# fp32, ~5 ms per decode step). Only the first few sorted entries can ever
+# matter: top-k keeps k <= cap tokens, and the top-p cutoff either falls inside
+# the top-cap prefix (computable from it) or beyond it, in which case the
+# combined (top-k, top-p) cutoff equals the top-k cutoff. See
+# _apply_top_k_top_p_topk_mask for the equivalence argument.
+_TOPK_TOPP_FAST_CAP = 128
+_TOPK_TOPP_FAST_MIN_VOCAB = 8192
+
+
+def _apply_top_k_top_p_topk_mask(
+    logits: torch.Tensor,  # [B, V]
+    probs: torch.Tensor,  # [B, V], softmax of logits
+    k: torch.Tensor | None,  # [B] or None
+    p: torch.Tensor | None,  # [B] or None
+) -> torch.Tensor:
+    """Sort-free top-k/top-p masking via a narrow topk prefix.
+
+    Equivalent to the sort-based implementation below because
+    ``masked_fill_(probs < c_k)`` then ``masked_fill_(probs < c_p)`` is the
+    same as a single fill with ``max(c_k, c_p)``:
+
+    - top-k rows (k <= cap): cutoff_k = vals[k - 1] is exact.
+    - top-p: with vals the descending top-cap probs and c the descending
+      cumsum, the top-p cutoff is vals[m - 1] where m is the first index with
+      c[m - 1] > p. If no such index exists within the cap, the true top-p
+      cutoff lies beyond position cap, hence below vals[cap - 1]; combined
+      with any valid cutoff_k (>= vals[k - 1] >= vals[cap - 1]) the max is
+      cutoff_k, so skipping top-p for that row is exact. Rows without a valid
+      k degrade leniently (no top-k truncation), never over-truncate.
+    """
+    vocab = probs.shape[-1]
+    cap = min(_TOPK_TOPP_FAST_CAP, vocab)
+    vals, _ = torch.topk(probs, cap, dim=-1)  # [B, cap], descending
+
+    neg_inf = float("-inf")
+    cutoff = None
+    if k is not None:
+        valid_k = (k >= 1) & (k <= cap)
+        gather_idx = k.clamp(1, cap).unsqueeze(-1)  # [B, 1], keep gather in range
+        cutoff_k = vals.gather(-1, gather_idx - 1).squeeze(-1)  # [B]
+        cutoff_k = torch.where(valid_k, cutoff_k, neg_inf)
+        cutoff = cutoff_k
+    if p is not None:
+        hit = vals.cumsum(-1) > p.unsqueeze(-1)  # [B, cap]
+        has_hit = hit.any(-1)
+        first_hit = hit.to(torch.long).argmax(-1, keepdim=True)  # 0 if no hit
+        cutoff_p = vals.gather(-1, first_hit).squeeze(-1)  # [B]
+        cutoff_p = torch.where(has_hit, cutoff_p, neg_inf)
+        cutoff = cutoff_p if cutoff is None else torch.maximum(cutoff, cutoff_p)
+
+    assert cutoff is not None
+    logits.masked_fill_(probs < cutoff.unsqueeze(-1), -float("inf"))
+    return logits
+
+
 def _apply_top_k_top_p_pytorch(
     logits: torch.Tensor,  # [B, V_local]
     k: torch.Tensor,  # [B] or None
@@ -120,6 +177,13 @@ def _apply_top_k_top_p_pytorch(
         return logits
 
     probs = logits.softmax(dim=-1)
+
+    # Wide-vocab rows: replace the [B, V] sort + cumsum (pathologically slow
+    # aclnnCumsum on wide rows) with a narrow topk-based mask. Small vocabs
+    # keep the original sort-based path, where sort/cumsum are cheap.
+    if probs.shape[-1] >= _TOPK_TOPP_FAST_MIN_VOCAB:
+        return _apply_top_k_top_p_topk_mask(logits, probs, k, p)
+
     probs_sort, _ = probs.sort(dim=-1, descending=False)
 
     if k is not None:
