@@ -160,6 +160,17 @@ class AscendAttentionBackend(AttentionBackend):
         if is_minimax_m3_fp8_kv_cache(get_current_vllm_config_or_none()):
             # Keep 128 as a common kernel block with M3 sparse/indexer caches.
             return [MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE, 128]
+        # C8-MXFP layers (--kv-cache-dtype mxfp8) use 512-token pages. Without
+        # 512 in this list the hybrid KV manager cannot find a common kernel
+        # block between them and the bf16 sliding-window layers that
+        # --kv-cache-dtype-skip-layers keeps unquantized (ValueError: No
+        # common block size). Keep 128 for those layers.
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            from vllm_ascend.utils import is_c8_mxfp_kv_quant
+
+            if is_c8_mxfp_kv_quant(vllm_config):
+                return [512, 128]
         return [128]
 
 
