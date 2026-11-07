@@ -423,7 +423,43 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
 5. `quant_mode=5` 在 wrapper 枚举里存在但 C++ 只收 {0,1,6}——与 mask_mode=4
    同一教训：**接口声明≠算子实现，必须运行时探**。
 
+**v10 补充（同日晚，探针 probe7）：win 参数门也关死 + 系统级结论修订。**
+
+| 探针 | 配置 | 结果 |
+|---|---|---|
+| P1/P2 win 参数 | mode0 + win_left=15/win_right=0（T=1 / T=6） | ❌ metadata op 硬拒："When maskMode is not 4 (SLIDING_WINDOW), winLeft and winRight must be -1, but got winLeft=15" |
+| P5 mode3+win | mode3 + zeros[2048,2048] + win15 | ❌ 同上（win 只属于 mode4，mode4 又被 tiling 拒） |
+
+⇒ **窗口机制穷尽：唯一可用 = 窗口即视图（T=1 decode）**。结合 S1 实测（零 C8 KV、
+overlay 要求各组每层 page_size 相等），滑窗 C8 的端到端链条断在三处：
+①P 侧 prefill（T>1，chunk 8192 > mask 网格 2048，无 win 参数）无精确算子路径读
+C8 滑窗缓存 ⇒ P 滑窗必须 bf16；②connector 裸拷贝块字节 ⇒ P bf16 / D C8 的滑窗
+传输会把 bf16 字节写进 C8 缓存（除非 quantize-on-send，大改造）；③滑窗组保持
+bf16 ⇒ bytes_per_block 被 sliding bf16 组（21 层 × 64KB = 1.342MB）钉住。
+
+**S2 修订范围（替代上文结论 3 的"2.8× 杠杆无阻塞"表述）**：full 组 C8 两侧 +
+混合页距 allocator（full 32KB / sliding 64KB 下 `can_overlay_attention_kv_groups()`
+按层相等判定必 False，是新的关键路径）+ 滑窗保持 bf16（S1 逻辑不动）⇒
+bytes_per_block 1.704 → 1.342MB，**P/D 池 ~1.27×**（P 48→~61、D 67→~85 在途），
+吞吐封顶 +27%、TTFT 队列 −21%。full-C8 为**首次生产 C8**（CLAUDE.md 坑 #7：
+C8 KV 从未真跑过；full 层 prefill TND 同为首次）⇒ 精度三件套（GSM8K ≥95 raw +
+sink 复测 + 长稳）是硬闸门。窗口即视图探针价值重定位：D 侧滑窗 C8 的算子前置
+已验证，但端到端被 ①②锁死——留作 CANN 修 mode4 或传输量化落地后的现成方案，
+当下不投工程。
+
 ### S3 D 侧步进
+
+**2026-11-08 实测后的定位（重要）**：
+
+- **步进已接近权重带宽下限**：W4A4C8 每卡权重 21.35 GiB、TPOT 20.8–23.5 ms ⇒ 等效权重流
+  ≈ 21.35 GiB / 22 ms ≈ **970 GB/s/卡**，基本贴着 950DT 的 HBM 带宽。
+  ⇒ 元素级优化（标量折叠、lm_head bf16、norm 融合）在这条链路上最多回收 2–5%，
+  **暂缓**；能再提速的只有"少读权重"（更激进量化）或"提高并发"（S2）。
+- **两个 -prof 开关**（第 1 条）：已 A/B，rate 1.8 下 4,845/5,095 vs 对照 5,008/5,122 ——
+  噪声内无收益，默认关（`S3_EXTRA=0`）。
+- **MTP 深度**：n=3 vs n=5 实测 6,448 vs 6,388 但 TPOT 23.13 vs 20.84 ⇒ **n=5 更优**。
+  accept 在 n=3 仍有 2.44–2.61（n=5 是 2.31–2.74）⇒ draft 收益前 2–3 个 token 就饱和，
+  而 verify 的权重流是常数 ⇒ 深度越浅越亏。
 
 1. `-prof` 已有但 new78 未开的两项：`enable_fused_o_proj_ar`、`enable_iquest_triton_qk_norm`。
 2. **标量折叠**（`model.py:536-549`；config 实测 `attn_out_scale=1.0`、
@@ -486,6 +522,7 @@ q_descale=N2TGD 5-D、scale 字节=127(e8m0 2^0)，与 `attention_c8_mxfp.py` �
 | **S4** | 同上 | rate 2.3 | 6,657 / 6,604 | 22.88 / 22.46 ms | 3.07 ✅ / 4.21 ⚠ | `pd_s4_open23r{1,2}.json`（临界） |
 | **S4** | 同上 | rate 2.4 | 6,741 | 22.70 ms | **4.31 ❌** | `pd_s4_open24r1.json` |
 | 对照 | 同上，**无共享前缀**（prefix0，输入 64k） | rate 1.0 | 1,605 | 11.73 ms | **78.6 s ❌** | `pd_prefix0_r1.json`｜P 侧 prefill 算力打满 |
+| **S3** | MTP 深度 n=3（默认 5） | rate 2.2 | 6,448 | **23.13 ms（更差）** | 3.54 s | `pd_s3_n3_open22.json`｜accept 2.44–2.61 与 n=5 相当、step 不省 ⇒ 回退 n=5 |
 | **稳态** | 同上，10 分钟长跑（1400 prompts） | rate 2.2 | **8,623** | 23.51 ms | **4.72 s ⚠** | `pd_soak22.json`｜实测 2.12 req/s、accept 2.6、无 preempt |
 
 **⚠ 短跑 vs 稳态（测量口径，2026-11-08 复核）**
