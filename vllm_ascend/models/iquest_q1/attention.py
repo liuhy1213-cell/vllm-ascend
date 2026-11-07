@@ -262,10 +262,24 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
 
         # Query heads are laid out kv-major: head h belongs to kv head h // group.
         q = query[:num_tokens].reshape(num_tokens, num_kv_heads, group, head_size)
+        # One batched per-kv-head GEMV instead of a [T, KV, G, D] fp32 product
+        # tensor plus a reduction. bf16 products are exact in the fp32
+        # accumulator, so versus the elementwise path the only difference is one
+        # bf16 rounding of the finished logit (<= ~0.3% relative, far below the
+        # bf16 output quantum); the permute keeps the GEMV large instead of
+        # degrading aclnnMatmul's broadcast-batch tiling on long prefill chunks.
+        sink_w = sink_key.to(q.dtype).unsqueeze(-1)  # [KV, D, 1]
         sink_logit = (
-            q.float() * sink_key.float().unsqueeze(1)  # [KV, 1, D]
-        ).sum(-1) * self.scale  # [T, KV, G]
-        sink_logit = sink_logit.reshape(num_tokens, num_heads)  # [T, H]
+            torch.bmm(
+                q.permute(1, 0, 2, 3).reshape(
+                    num_kv_heads, num_tokens * group, head_size
+                ),
+                sink_w,
+            )  # [KV, T*G, 1]
+            .reshape(num_kv_heads, num_tokens, group)
+            .permute(1, 0, 2)  # [T, KV, G]
+            .float() * self.scale
+        ).reshape(num_tokens, num_heads)  # [T, H]
 
         # TND LSE shape is (T, Q_N, 1); tolerate a (T, Q_N) 2D return as well.
         if lse.dim() == 3:
@@ -274,8 +288,13 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
             lse = lse.reshape(num_tokens, num_heads).unsqueeze(-1)
         lse = lse.float()
 
-        factor = torch.sigmoid(-(sink_logit.unsqueeze(-1) - lse))  # [T, H, 1]
-        attn_output[:] = (attn_output.float() * factor).to(attn_output.dtype)
+        # sigmoid(lse - logit) == sigmoid(-(logit - lse)) without the Neg kernel.
+        factor = torch.sigmoid(lse - sink_logit.unsqueeze(-1))  # [T, H, 1]
+        # factor rounds to exactly 1.0 in bf16 whenever it is >= 0.998, so the
+        # common case stays bit-exact; only genuinely suppressed heads see a
+        # <= ~0.2% relative change (one bf16 rounding instead of the fp32
+        # round-trip).
+        attn_output.mul_(factor.to(attn_output.dtype))
 
 
 class IQuestQ1AscendAttentionBackend(AscendAttentionBackend):
