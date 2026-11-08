@@ -813,7 +813,12 @@ class KVCacheRecvingThread(threading.Thread):
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
                     src = src_layer_base_addr + local_block_id[0] * block_stride
                     dst = dst_layer_base_addr + remote_block_id[0] * block_stride
-                    length = block_len * len(local_block_id)
+                    # A contiguous block-id run spans (n-1) strides plus one
+                    # page payload. With stride == block_len (every legacy
+                    # layout) this reduces to n * block_len; the mixed-page
+                    # overlay carries a larger stride, so the tail page must
+                    # not be multiplied away.
+                    length = (len(local_block_id) - 1) * block_stride + block_len
                     src_list.append(src)
                     dst_list.append(dst)
                     length_list.append(length)
@@ -1794,18 +1799,62 @@ class MooncakeConnectorWorker:
         assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
 
-    def _layer_kv_regions(self, layer_name: str, kv_cache_tuple: Any) -> list[tuple[int, int, tuple[int, int]]]:
+    def _tiled_page_geometry(self, tensors: list[torch.Tensor]) -> tuple[int, int, int] | None:
+        """Detect strided views that tile one physical page per block.
+
+        Returns ``(page_len, block_stride, view_num_blocks)`` when every view
+        shares the element size, dim-0 stride and block count, and the views'
+        per-block sections tile the page contiguously (the first section at
+        the block base, each next one right after the previous). That covers
+        the bf16 combined ``[K | V]`` page and the C8 packet
+        ``[K | Ks | V | Vs]`` page of the mixed-page overlay. Returns None
+        otherwise so genuinely disjoint buffers fall through.
+        """
+        if len(tensors) < 2:
+            return None
+        first = tensors[0]
+        el = first.element_size()
+        if any(
+            t.element_size() != el or t.stride(0) != first.stride(0) or t.shape[0] != first.shape[0]
+            for t in tensors
+        ):
+            return None
+        view_num_blocks = first.shape[0]
+        if view_num_blocks == 0:
+            return None
+        page_len = 0
+        expected = first.data_ptr()
+        for t in tensors:
+            section_bytes = t.numel() * el // view_num_blocks
+            if t.data_ptr() != expected:
+                return None
+            page_len += section_bytes
+            expected += section_bytes
+        block_stride = first.stride(0) * el
+        if block_stride < page_len:
+            return None
+        return page_len, block_stride, view_num_blocks
+
+    def _layer_kv_regions(
+        self, layer_name: str, kv_cache_tuple: Any
+    ) -> list[tuple[int, int, int, tuple[int, int]]]:
         """Resolve one layer's KV cache into transfer addresses and regions.
 
-        Returns ``[(base_addr, block_len, (register_ptr, register_len)), ...]``:
+        Returns ``[(base_addr, block_len, block_stride, (register_ptr, register_len)), ...]``:
 
         * one entry per layer for a single standalone tensor;
         * one entry for the whole covering span when K/V are strided views of
-          one ``[blocks, 2, tokens, h, d]`` buffer (V sits one K-page into it).
-          The views overlap and the transfer engine rejects overlapping
-          regions, so the span is registered once — a page is the contiguous
-          ``[K_b | V_b]`` slice, hence ``base + block_id * page_len`` addresses
-          exactly the bytes the per-view math would, on both sides;
+          one ``[blocks, 2, tokens, h, d]`` buffer with the block stride equal
+          to the page (V sits one K-page into it). The views overlap and the
+          transfer engine rejects overlapping regions, so the span is
+          registered once — a page is the contiguous ``[K_b | V_b]`` slice,
+          hence ``base + block_id * page_len`` addresses exactly the bytes
+          the per-view math would, on both sides;
+        * one entry per layer for the mixed-page overlay: strided views
+          tiling one true page per block with a block stride LARGER than the
+          page (bf16 ``[K | V]`` and C8 ``[K | Ks | V | Vs]`` packets).
+          Scheduler block ids address the slot through ``block_stride`` while
+          each transfer carries one contiguous ``page_len`` payload;
         * one entry per tensor for disjoint contiguous allocations.
 
         Shared by the uniform (single-group) and generic hybrid layouts.
@@ -1813,16 +1862,18 @@ class MooncakeConnectorWorker:
         if isinstance(kv_cache_tuple, (list, tuple)) is False:
             kv_cache_tuple = [kv_cache_tuple]
         tensors = sorted(kv_cache_tuple, key=lambda t: t.data_ptr())
-        entries: list[tuple[int, int, tuple[int, int]]] = []
+        entries: list[tuple[int, int, int, tuple[int, int]]] = []
         if len(tensors) == 1:
             single_kv_cache = tensors[0]
             tensor_num_blocks = single_kv_cache.shape[0]
             block_size_scale = tensor_num_blocks // self.num_blocks
             block_shape = single_kv_cache.shape[1:]
+            block_len = single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
             entries.append(
                 (
                     single_kv_cache.data_ptr(),
-                    single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale,
+                    block_len,
+                    block_len,
                     (
                         single_kv_cache.data_ptr(),
                         single_kv_cache.element_size() * math.prod(single_kv_cache.shape),
@@ -1830,16 +1881,45 @@ class MooncakeConnectorWorker:
                 )
             )
             return entries
-        first, second = tensors
-        k_page = first.element_size() * math.prod(first.shape[1:])
-        page_len = 2 * k_page
-        interleave_stride = first.stride(0) * first.element_size()
-        if (
-            second.data_ptr() - first.data_ptr() == k_page
-            and interleave_stride == page_len
-            and second.stride(0) == first.stride(0)
-        ):
-            span = page_len * first.shape[0]
+        tiled = self._tiled_page_geometry(tensors)
+        if tiled is not None and tiled[1] > tiled[0]:
+            # Mixed-page overlay: one true page per scheduler block, addressed
+            # through the (larger) block stride. The register region is the
+            # layer's covering extent; the hybrid registration replaces it
+            # with the storage-merged backing range, where overlapping
+            # per-layer extents are expected and allowed.
+            page_len_t, block_stride_t, view_num_blocks = tiled
+            if view_num_blocks % self.num_blocks:
+                raise ValueError(
+                    f"Overlay KV view for {layer_name} has {view_num_blocks} blocks, "
+                    f"not a multiple of num_blocks ({self.num_blocks})."
+                )
+            logger.info(
+                "Registering overlay KV slot for %s: base=0x%x page=%d B stride=%d B x %d blocks",
+                layer_name,
+                tensors[0].data_ptr(),
+                page_len_t,
+                block_stride_t,
+                view_num_blocks,
+            )
+            entries.append(
+                (
+                    tensors[0].data_ptr(),
+                    page_len_t,
+                    block_stride_t,
+                    (
+                        tensors[0].data_ptr(),
+                        (view_num_blocks - 1) * block_stride_t + page_len_t,
+                    ),
+                )
+            )
+            return entries
+        if tiled is not None and tiled[1] == tiled[0]:
+            # Uniform interleaved span: block stride == page, so consecutive
+            # blocks are contiguous and the whole span registers as one
+            # region (stride is recorded as the page for bookkeeping parity).
+            page_len_t, block_stride_t, view_num_blocks = tiled
+            span = page_len_t * view_num_blocks
             if span % self.num_blocks != 0:
                 raise ValueError(
                     f"Interleaved KV span for {layer_name} ({span} B) is not "
@@ -1848,21 +1928,25 @@ class MooncakeConnectorWorker:
             logger.info(
                 "Registering interleaved KV span for %s: base=0x%x page=%d B x %d blocks",
                 layer_name,
-                first.data_ptr(),
-                page_len,
-                first.shape[0],
+                tensors[0].data_ptr(),
+                page_len_t,
+                view_num_blocks,
             )
-            entries.append((first.data_ptr(), page_len, (first.data_ptr(), span)))
+            entries.append(
+                (tensors[0].data_ptr(), page_len_t, block_stride_t, (tensors[0].data_ptr(), span))
+            )
             return entries
         # Disjoint contiguous allocations: register each tensor as its own region.
         for single_kv_cache in tensors:
             tensor_num_blocks = single_kv_cache.shape[0]
             block_size_scale = tensor_num_blocks // self.num_blocks
             block_shape = single_kv_cache.shape[1:]
+            block_len = single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
             entries.append(
                 (
                     single_kv_cache.data_ptr(),
-                    single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale,
+                    block_len,
+                    block_len,
                     (
                         single_kv_cache.data_ptr(),
                         single_kv_cache.element_size() * math.prod(single_kv_cache.shape),
@@ -1874,10 +1958,10 @@ class MooncakeConnectorWorker:
     def _record_layer_kv_regions(self, layer_name: str, kv_cache_tuple: Any) -> list[tuple[int, int]]:
         """Append one layer's addresses to the transfer metadata; return register regions."""
         entries = self._layer_kv_regions(layer_name, kv_cache_tuple)
-        for base_addr, block_len, _ in entries:
+        for base_addr, block_len, _, _ in entries:
             self.kv_caches_base_addr.append(base_addr)
             self.block_len_per_addr.append(block_len)
-        return [region for _, _, region in entries]
+        return [region for _, _, _, region in entries]
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
@@ -1980,7 +2064,9 @@ class MooncakeConnectorWorker:
                 group_idx = layer_group_idx.get(layer_name)
                 if group_idx is None:
                     raise ValueError(f"Layer {layer_name} is not assigned to any KV cache group.")
-                for base_addr, block_len, (ptr, length) in self._layer_kv_regions(layer_name, kv_cache_tuple):
+                for base_addr, block_len, block_stride, (ptr, length) in self._layer_kv_regions(
+                    layer_name, kv_cache_tuple
+                ):
                     # Every layer keeps its own entry even when two groups alias
                     # the same physical slot: a block ID belongs to one group at
                     # a time, so group g's blocks are addressed from the slot its
@@ -1988,12 +2074,22 @@ class MooncakeConnectorWorker:
                     # stop transferring whole groups.
                     self.kv_caches_base_addr.append(base_addr)
                     self.block_len_per_addr.append(block_len)
+                    self.block_stride_per_addr.append(block_stride)
                     self.addr_group_idx.append([group_idx])
                     ptrs.append(ptr)
                     lengths.append(length)
-            # Every recorded region is one contiguous page, so the distance
-            # between consecutive blocks equals the block length.
-            self.block_stride_per_addr.extend(self.block_len_per_addr)
+            # Every legacy layout (standalone, interleaved span, disjoint) has
+            # a block stride equal to the block length; only the mixed-page
+            # overlay records a larger stride, which the transfer loop uses
+            # for the per-block address step.
+            if self._prefill_pp_size > 1 and any(
+                stride != length for stride, length in zip(self.block_stride_per_addr, self.block_len_per_addr)
+            ):
+                raise ValueError(
+                    "The C8 mixed-page KV overlay does not support prefill PP > 1: "
+                    "the per-PP pull path assumes a block stride equal to the "
+                    "block length."
+                )
             logger.info(
                 "Hybrid KV layout: %d groups, %d transfer addresses, per-group=%s, block_lens=%s",
                 len(self.kv_cache_config.kv_cache_groups),
