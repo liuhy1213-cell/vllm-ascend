@@ -353,6 +353,31 @@ the recipe is not enabled"，且所有层的注册日志都是 `page=65536 B`（
    ⇒ **S2 只有一条可行路线：full + sliding 同时 C8（两组都 32KB），
    收益 ≈ 2×（1.70 → 0.85 MB/block）**；若要分批上，必须先扩展 overlay 支持混合页距。
 
+### S2 【2026-11-08 复核】路径 A 只需要一行判定，不是分配器重写
+
+初版设计稿（`docs/S2_路径A_混合页距分配器设计稿.md`）假设"混合页距必须改 `as_strided`、
+块间距统一成 `bytes_per_block`"，**假设错误**。重读 vLLM
+`v1/kv_cache_interface.py:compute_layout_strides()`：`fixed_strides` 只在
+`layout.is_block_outermost` 时钉 `block_stride = bytes_per_block`，而本模型是 **LBNHC
+（layer-outer）**，所以：
+
+- 组内：`block_stride = 该组 page`、`layer_stride = num_blocks × 该组 page`
+  —— **每层仍是一段连续区间**；
+- 组间：只是从 byte 0 别名（`byte_offset` 每个 group 循环重置）；
+- 混合页距下 full 组占 `NB × 878,592`、sliding 组占 `NB × 1,376,256`，
+  都在 `bytes_per_block × NB` 的 backing 内。
+
+⇒ 现有 `_allocate_kv_cache()` overlay 分支的三个校验在混合页距下**全部成立**，
+连接器的 `block_len == block_stride` 假设也**不变**。
+⇒ **只需放宽 `can_overlay_attention_kv_groups()` 的"跨组页大小相等"条件**
+（改为"组内一致"，这由 group spec 保证）。
+
+改动已落在**独立分支** `feat/iquest-pd-c8-mixed-pages`（`2c2ca4520`），**未合入部署分支、
+未上机验证**：等页距下行为与改动前完全一致。真正的风险在 C8 算子侧
+（`attention_c8_mxfp.py` 的 prefill TND + sink 从未在任何部署跑过，
+`37a95d2bc` 的 512 kernel block 也未验证）⇒ 验证顺序应为**先单机跑 C8 + GSM8K + sink 复测，
+再上 PD**。
+
 ### S2 KV-C8（mxfp8 KV cache）
 
 - **关键结论**：上次 C8 崩溃的根因就是"合组"，所以 **S1 是 S2 的前置**。
