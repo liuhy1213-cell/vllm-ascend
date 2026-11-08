@@ -1014,3 +1014,57 @@ storage_offset≠0 由 extent 校验覆盖。
 new78 长稳结束：§4-3 容量校验（`NPU KV cache size` ≈ bf16 2,387,389 × 1.238，
 bpb 行落 5,505,024）→ §4-4 精度三件套（GSM8K≥95 + sink + 128k）→ §4-5/4-6
 性能闸门。长压测用分段法（客户端物化 64k prompt 会卡生成阶段）。
+
+**§4.4 精度三件套 harness 就绪 + bf16 基线（2026-11-08，精度侧会话，与 allocator 实现并行无碰撞）**：
+- 资产（`deploy/iquest-sla-throughput/`，SFS 全机可见）：
+  `s2_needle_128k.py`——128k 大海捞针：~120k token 随机填充（seed 决定）+ 随机口令
+  `PK-WORD-12345`，深度 0.25/0.5/0.9，贪心；**必须 `--max-tokens 2000`**（48 会被
+  思考耗光，finish=length 假阴），命中判定扫 content+reasoning 全文。用法：
+  `python3 -I /pd/s2_needle_128k.py --url <engine> --max-tokens 2000 [--seed S] [--out j]`。
+  `s2_sink_retest.sh`——三件套包装：容器 import 自检 → `qfa_lse_probe` 算子探针 →
+  GSM8K-100×N（复用 quant/kv_c8/eval_gsm8k.py 口径）；**须在引擎宿主机执行**
+  `bash /pd/s2_sink_retest.sh <url> <container> [model] [rounds]`（docker exec 不能跨机）。
+- bf16 基线（A 机 10.222.47.74:7100，opt 栈 bf16 KV）：
+  needle 双 seed **6/6 全命中**（prompt 实测 128,490-128,594 tokens，冷 prefill 4.3-6.3s），
+  `logs/s2_needle_bf16_r1.json`、`logs/s2_needle_bf16_r2_cold.json`；
+  GSM8K-100 = **97/100**（errors=0，truncated=2+no_pred=2 全截断，与 {95,97} 基线同分布）；
+  探针复现 **k=mult v=mult 胜出**（out_err 0.042 ≪ 其他组合 0.53-0.76，lse_ln_err 0.0017
+  vs 0.374）⇒ QFA K/V dequant ×2^(s-127) 方向与打包假设一致。证据
+  `logs/sink_retest_1108_1653/`（含 README 快照）。探针是算子级自建视图、与引擎配置
+  无关，该结论对 C8 栈直接有效（iquest-sla-a 的 /workspace=vllm-ascend-opt 已验证
+  attention_c8_mxfp + cann_ops_transformer 可导入）。
+- C8 侧执行口径（等 C8 引擎）：needle 同 seed（20261108/20261109）同脚本；
+  GSM8K ≥95 且 errors=0；探针 k/v 胜出组合若变异即红旗。
+
+### 8.3 Patch 4（connector block_len/block_stride 拆分）：离线实现完成（2026-11-08 17:1x）
+
+提交 `d827e8b06`（`mooncake_hybrid_connector.py`，+127/-31）。overlay 交给
+connector 的层视图块距（5,505,024 B）大于真页（135,168/262,144），旧
+`_layer_kv_regions` 只认 stride==page 的均匀交错 span 与 disjoint 兜底——overlay
+视图判定失败落 disjoint 分支，K/V 注册成两个重叠 region（传输引擎拒绝）且地址表
+每层翻倍。四处改动：
+
+1. `_tiled_page_geometry`：识别"N 个等 stride 等块数视图逐段铺满一个页"（bf16
+   [K|V]、C8 [K|Ks|V|Vs] 各 65,536/2,048 B 段）；独立 K/V buffer 被_stride≥page
+   守卫拒绝（stride=block_len<page）→ disjoint 分支保持；均匀路径 stride==page
+   → 交错 span 分支保持。
+2. `_layer_kv_regions` 返回四元组 `(base, block_len, block_stride, region)`：
+   overlay 记 block_len=真页、block_stride=bpb；所有旧布局 stride==block_len 不变。
+3. pull 循环连续 run 传输长度改 `(n-1)*block_stride + block_len`（stride==len 时
+   恒等于旧式 n*block_len）；`group_concurrent_contiguous` 的 run 严格连续
+   （diff≠1 切分），窗口精确覆盖不多不少。
+4. 注册侧无需改：`collect_configured_register_regions` 本就按 backing storage
+   合并（overlay 88 层一份 region）；overlay+prefill PP>1 显式拒绝（per-PP pull
+   路径仍假设 stride==len，1P1D 不受影响）。
+
+**验证**：单测新增 §K 共 **66 项全绿**（A 机容器）；真实 `_layer_kv_regions`
+容器内四几何实测过（overlay bf16→(base,262,144,5,505,024)、overlay C8 四视图→
+(base,135,168,5,505,024)、uniform→stride==page、separate→双 entry）。
+单机验证不经过 connector；PD 形态验证需两侧都开 overlay。
+
+**S2 全套（Patch 1-4 + 预算 token 归一）至此离线闭环**：`51954711c` config →
+`daf0cfa87` worker → `4cb6108e6` notes+脚本 → `d827e8b06` connector。
+上机验证由精度侧会话接手（43.87，worktree `vllm-ascend-s2a` @ 4cb6108e6；
+Patch 4 非单机必需）。激活开关：`VLLM_ASCEND_ENABLE_C8_MIXED_OVERLAY=1` +
+V2 runner + `--kv-cache-dtype mxfp8 --kv-cache-dtype-skip-layers sliding_window`
++ block 512。

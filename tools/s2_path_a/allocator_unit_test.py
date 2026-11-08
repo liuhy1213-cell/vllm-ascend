@@ -31,6 +31,11 @@ NPU (pure tensor geometry on CPU):
   J. reshape views     as_strided K/V math for both backends: stride(0)=bpb,
                        kv[0] contiguous (zeroer assert), ptr gap = K payload,
                        block pitch = bpb, kernel block = spec block = 512
+  K. connector         Patch 4: the tiled-page detection resolves bf16 [K,V]
+                       and C8 [K,Ks,V,Vs] overlay views to ONE entry
+                       (block_len = true page, block_stride = bpb); separate
+                       buffers and the uniform span keep their branches; the
+                       pull length (n-1)*stride + page covers exactly the run
 
 Log-anchored parameters (new78 D side engine.log, 2026-11-08 00:19:38):
   4 groups [26 full, 21, 21, 21 sliding], every page = 65,536 B,
@@ -473,8 +478,104 @@ check(
     ratio_j == 1 and NB_J * ratio_j == NB_J,
 )
 
+# ============================== K: connector regions under the overlay (Patch 4)
+# Mirror of mooncake_hybrid_connector._tiled_page_geometry / _layer_kv_regions
+# and the pull-loop length (n-1)*block_stride + block_len. Under the overlay a
+# bf16 layer hands the connector [K, V] strided views and a C8 layer the
+# [K, Ks, V, Vs] packet views; both must resolve to ONE entry with
+# block_len = true page and block_stride = bpb — the old code fell through to
+# the disjoint branch and registered overlapping K/V regions.
+
+
+def tiled_page_geometry(tensors):
+    if len(tensors) < 2:
+        return None
+    first = tensors[0]
+    el = first.element_size()
+    if any(
+        t.element_size() != el or t.stride(0) != first.stride(0) or t.shape[0] != first.shape[0]
+        for t in tensors
+    ):
+        return None
+    nb_t = first.shape[0]
+    if nb_t == 0:
+        return None
+    page_len_t, expected = 0, first.data_ptr()
+    for t in tensors:
+        section = t.numel() * el // nb_t
+        if t.data_ptr() != expected:
+            return None
+        page_len_t += section
+        expected += section
+    stride_t = first.stride(0) * el
+    return None if stride_t < page_len_t else (page_len_t, stride_t, nb_t)
+
+
+NB_K = 32
+K_HALF_B = BLOCK_S2 * HD_S2 * EL_S2  # 131,072 B per-block K (or V) section
+backing_k = torch.zeros(NB_K * bpb_s2, dtype=torch.uint8)
+off3 = 3 * PAGE_SLIDE_S2
+K_k = torch.as_strided(backing_k, (NB_K, K_HALF_B), (bpb_s2, 1), off3)
+V_k = torch.as_strided(backing_k, (NB_K, K_HALF_B), (bpb_s2, 1), off3 + K_HALF_B)
+g_bf16 = tiled_page_geometry([K_k, V_k])
+check("K overlay bf16: tile detection passes", g_bf16 is not None)
+check(
+    "K overlay bf16: (page 262,144, stride bpb, NB)",
+    g_bf16 == (PAGE_SLIDE_S2, bpb_s2, NB_K),
+)
+# C8 packet layer 5: sections K=65,536 Ks=2,048 V=65,536 Vs=2,048 (sum 135,168)
+SEC_K, SEC_S = 65_536, 2_048
+off5 = 5 * PAGE_C8_S2
+views_c8 = []
+pos_c8 = off5
+for sz in (SEC_K, SEC_S, SEC_K, SEC_S):
+    views_c8.append(torch.as_strided(backing_k, (NB_K, sz), (bpb_s2, 1), pos_c8))
+    pos_c8 += sz
+g_c8 = tiled_page_geometry(views_c8)
+check("K overlay C8: 4-view packet tile detection passes", g_c8 is not None)
+check(
+    "K overlay C8: (page 135,168, stride bpb, NB)",
+    g_c8 == (PAGE_C8_S2, bpb_s2, NB_K),
+)
+# separate K/V buffers (old per-layer private layout): stride(0) = block_len <
+# page -> tile detection must return None -> disjoint branch preserved
+kb_sep = torch.zeros(NB_K * PAGE_SLIDE_S2, dtype=torch.uint8)
+vb_sep = torch.zeros(NB_K * PAGE_SLIDE_S2, dtype=torch.uint8)
+K_sep = torch.as_strided(kb_sep, (NB_K, K_HALF_B), (K_HALF_B, 1), 0)
+V_sep = torch.as_strided(vb_sep, (NB_K, K_HALF_B), (K_HALF_B, 1), 0)
+check(
+    "K separate K/V buffers: tile detection None (disjoint branch kept)",
+    tiled_page_geometry([K_sep, V_sep]) is None,
+)
+# uniform padded path: stride == page -> interleaved span branch preserved
+K_u = torch.as_strided(backing_k, (NB_K, K_HALF_B), (PAGE_SLIDE_S2, 1), 0)
+V_u = torch.as_strided(backing_k, (NB_K, K_HALF_B), (PAGE_SLIDE_S2, 1), K_HALF_B)
+check(
+    "K uniform path: stride == page (interleaved span preserved)",
+    tiled_page_geometry([K_u, V_u]) == (PAGE_SLIDE_S2, PAGE_SLIDE_S2, NB_K),
+)
+# pull length over a contiguous 3-block run: covers exactly the run's pages,
+# neither cutting the tail page nor reaching into block 13
+run_ids = [10, 11, 12]
+flat = torch.as_strided(backing_k, (NB_K * bpb_s2,), (1,), 0)
+backing_k.zero_()
+for b in run_ids:
+    flat[off3 + b * bpb_s2] = 0xAB
+    flat[off3 + b * bpb_s2 + PAGE_SLIDE_S2 - 1] = 0xCD
+start_k = off3 + run_ids[0] * bpb_s2
+length_k = (len(run_ids) - 1) * bpb_s2 + PAGE_SLIDE_S2
+covered = torch.as_strided(backing_k, (length_k,), (1,), start_k)
+check(
+    "K pull length: run's first/last payload bytes covered",
+    covered[0].item() == 0xAB and covered[-1].item() == 0xCD,
+)
+check(
+    "K pull length: transfer ends before block 13's payload",
+    start_k + length_k < off3 + 13 * bpb_s2,
+)
+
 print()
 if failures:
     print(f"UNIT_TEST_FAILED: {len(failures)} failing: {failures}")
     sys.exit(1)
-print("UNIT_TEST_PASSED: layout geometry, capacity, connector split, regression, S2 target geometry (G-J) all green")
+print("UNIT_TEST_PASSED: layout geometry, capacity, connector split, regression, S2 target geometry (G-J), connector overlay regions (K) all green")
