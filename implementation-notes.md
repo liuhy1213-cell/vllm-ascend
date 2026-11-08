@@ -962,3 +962,55 @@ Available 13.15 GiB、`NPU KV cache size: 448,133 tokens`（concurrency 3.42x）
 - **结论**：C8 的失败 100% 在分配/预算层，算子层清零。skip-layers platform 形态
   （无论 V1/V2）整体否决；收益唯一路径 = S2 as_strided（Patch 1-4 + 真混合页 +
   预算语义按 token 归一）。A 机已恢复 optimal bf16（V2+MTP+EP+MC2，07:20 起拉）。
+
+### 8.2 S2 Patch 1-4 + 预算 token 归一：离线实现完成（2026-11-08 16:5x）
+
+本分支（`perf/iquest-pd-hybrid-kv-20261108`）三笔提交，全部默认关闭、由
+`VLLM_ASCEND_ENABLE_C8_MIXED_OVERLAY=1` + `--kv-cache-dtype mxfp8
+--kv-cache-dtype-skip-layers ...` + V2 runner 签名门控，等页部署行为不变：
+
+1. **config 侧**：`utils.is_c8_mixed_kv_overlay_enabled`（env+mxfp8+skip-layers
+   三重门）；`platform._align_heterogeneous_kv_block_size` 覆写——overlay 开启时
+   跳过上游 lift（否则 block 512→1024 + skip 页统一 pad，重新引入 4× 浪费）；
+   `patch_kv_cache_utils` 识别真页 spec 集（混合页 + 无 `page_size_padded` +
+   fp8e4m3fn full 组 + 仅 Full/Sliding 类型）→ 绕过 `unify_kv_cache_spec_page_size`
+   直接 `_get_kv_cache_groups_uniform_page_size` 分组（[26 full C8, 21×3 sliding]）
+   → `_get_c8_mixed_overlay_kv_cache_config` 建 block-outer descriptor：
+   bpb = max(组Σ页) = 21×262,144 = **5,505,024**（sliding 钉住），
+   `num_blocks = available // bpb`（`may_override_num_blocks` 保留），
+   每组 `KVCacheTensor(offset=0, layer_stride=页, block_stride=bpb)`。
+   **预算 token 归一是自动达成**：10,752 B/token vs bf16 13,312 = ×1.238（=26/21）。
+2. **worker 侧**：`can_overlay_attention_kv_groups` C8 分支放宽为"组内等页 +
+   dtype ∈ {fp16,bf16,fp8e4m3fn}"（跨组页可不同）；`_allocate_kv_cache`
+   block-outer 子分支（每层 1-D slice `backing[offset+layer_idx*layer_stride:]`，
+   校验 `block_stride≥页` 与 extent 入界）；`_reshape_kv_cache_v2` C8 层用
+   `mxfp_paged_cache_views(page_stride_bytes=bpb)` + config 块数、generic 层把
+   `page_stride_bytes=bpb` 喂给 combined K/V reshape（stride(0)=bpb，K/V 页内
+   对半）；`mxfp_paged_cache_views` 容量校验改 storage-extent（solo 分配与旧
+   numel 校验逐 case 等价）。hybrid_backing 单份分配模型天然命中（4 descriptor
+   同 size → 一份 `NB×bpb` backing，注释明说防 4× 重复分配）。
+3. **离线验证**（A 机容器）：单元测试扩到 §G-§J 共 **59 项全绿**
+   （`tools/s2_path_a/allocator_unit_test.py`，工作区副本 docs/ 同名）；
+   `tools/s2_path_a/budget_arithmetic_check.py` 23 项全绿；六文件 import 冒烟
+   （cwd 优先覆盖 site-packages）+ 门控函数 7 case 冒烟通过。
+
+**自审抓掉的两颗运行时炸弹**（py_compile 抓不到）：
+- `_get_per_layer_spec` 在 patch 文件里被用但从未定义/导入（上游
+  `vllm/v1/core/kv_cache_utils.py:1578` 有现成实现）→ 已加 import；
+- 日志行 `group.kv_cache_spec.block_size`——`UniformTypeKVCacheSpecs` 类上
+  **没有** block_size 属性 → 改经 `_get_per_layer_spec` 取底层 spec。
+
+**端到端链路核实结论**（无需再查）：V2 runner 继承上游 GPUModelRunner，
+`prepare_kernel_block_sizes` 对无 layer-views 的组直接取 `spec.block_size`=512
+→ `num_blocks_per_kv_block=1`；zero-block Triton kernel 读真实视图
+`stride(0)`、只清 payload、按 data_ptr 去重（block-outer 各层 slice 起点不同，
+无误并）；sliding 组是 `SlidingWindowSpec(AttentionSpec)` 非 FullAttentionSpec
+子类 → 不进清零链（与现网一致）；`can_share_full_and_sliding_kv_cache` 被
+gemma4_text 门挡住不会劫持；`mxfp_paged_cache_views` 要求 1-D int8 连续视图，
+hybrid_backing 恰是 int8 1-D；kv_transfer 非空时 `_align_memory` slice 的
+storage_offset≠0 由 extent 校验覆盖。
+
+**未做/后续**：Patch 4（connector block_stride 拆分）仅 PD 需要；上机验证等
+new78 长稳结束：§4-3 容量校验（`NPU KV cache size` ≈ bf16 2,387,389 × 1.238，
+bpb 行落 5,505,024）→ §4-4 精度三件套（GSM8K≥95 + sink + 128k）→ §4-5/4-6
+性能闸门。长压测用分段法（客户端物化 64k prompt 会卡生成阶段）。
