@@ -29,6 +29,7 @@ prefill runs eagerly.
 """
 
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import islice
 
 import torch
@@ -427,12 +428,30 @@ class IQuestQ1Attention(nn.Module):
             attn_cls = IQuestQ1AscendAttention
             sink_args["sink_key"] = self.sink_k
 
+        # [S2 C8 overlay] The MTP draft layer is not covered by the C8 KV recipe
+        # (c8_kv_v_scales only calibrates the target full-attention layers), so
+        # under a quantized global --kv-cache-dtype its attention must stay on a
+        # bf16 cache. Under the hybrid KV cache manager, also let its SPEC carry
+        # the trained sliding window: the kernel already windows (the impl
+        # captured the window at build time below), so a SlidingWindowSpec only
+        # changes the scheduler's view - the draft joins a tiny windowed group
+        # instead of a full-length one. The disabled-hybrid PD form keeps the
+        # historical full-spec view unchanged.
+        draft_windowed_spec = (
+            is_mtp_layer
+            and real_sliding_window is not None
+            and not getattr(vllm_config.scheduler_config, "disable_hybrid_kv_cache_manager", False)
+        )
+        attn_cache_config = self.cache_config
+        if draft_windowed_spec:
+            attn_cache_config = replace(self.cache_config, cache_dtype="auto")
+
         self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            cache_config=self.cache_config,
+            cache_config=attn_cache_config,
             per_layer_sliding_window=real_sliding_window,
             quant_config=quant_config,
             attn_type=AttentionType.DECODER,
@@ -440,7 +459,7 @@ class IQuestQ1Attention(nn.Module):
             prefix=f"{prefix}.attn",
             **sink_args,
         )
-        if is_mtp_layer and real_sliding_window is not None:
+        if is_mtp_layer and real_sliding_window is not None and not draft_windowed_spec:
             # The draft checkpoint runs a trained sliding window, but only in
             # the kernel: the attention impl captured the window at build time
             # above, so its FIA calls keep sparse_mode=4/pre_tokens. The
@@ -450,6 +469,8 @@ class IQuestQ1Attention(nn.Module):
             # FullAttentionSpec.merge rejects a second distinct window value
             # next to the target's promoted SWA window. Allocation is full
             # either way; clearing the module attr only changes the spec view.
+            # With the hybrid manager active (draft_windowed_spec) the spec
+            # keeps the window instead - see the comment above.
             self.attn.sliding_window = None
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
