@@ -6,6 +6,12 @@ D3 geometry (D side 5 groups [full 25, sl 21, 21, 21, draft 1], P side 4).
 A real KVCacheRecvingThread is constructed with a fake transfer engine;
 paths exercised: draft-last skip, misordered-draft loud error, extra-local-
 group skip, equal-stride run fast path, asymmetric per-block fallback.
+
+S2 xL extension (2026-11-08): scenarios D/E cover _build_group_addr_views —
+a PACKED same-spec group (consecutive layer bases, diffs == page, symmetric
+peer pitch) collapses to ONE merged pull per block-run (the new78 -7.6%
+fix), while a group failing any packed gate falls back to per-layer pulls
+(byte-identical to the pre-patch behavior).
 """
 import sys
 import types
@@ -54,9 +60,22 @@ def d_side_layout():
     return addr_group_idx, strides, lens
 
 
-def make_thread(engine, draft_group_pos=None):
+def build_addrs(start, lens, packed):
+    """Layer bases. packed=True lays consecutive layers one page apart
+    (diff == block_len) — the block-outer packed geometry the merged pull
+    fast path requires; unpacked uses diff == 1 (never merges)."""
+    addrs, cur = [], start
+    for page in lens:
+        addrs.append(cur)
+        cur += page if packed else 1
+    return addrs
+
+
+def make_thread(engine, draft_group_pos=None, packed=False, remote_packed=None, n_remote=75):
     """Build the recving thread; draft_group_pos moves the draft's group for
-    the misordering scenario (None = draft-last, the required order)."""
+    the misordering scenario (None = draft-last, the required order).
+    n_remote is the peer's addr-list length (88 = real D3 P side, 75 also
+    proves the shorter-peer truncation tolerance)."""
     sizes = GROUP_SIZES
     if draft_group_pos is not None:
         # Rotate so the draft group really sits at draft_group_pos: the group
@@ -70,8 +89,10 @@ def make_thread(engine, draft_group_pos=None):
             strides.append(GROUP_STRIDES[gi % len(GROUP_STRIDES)])
             lens.append(GROUP_LENS[gi % len(GROUP_LENS)])
     n_layers = len(addr_group_idx)
-    local_addrs = list(range(1000, 1000 + n_layers))
-    remote_addrs = list(range(5000, 5000 + 75))  # P side: 4 groups, 75 layers
+    local_addrs = build_addrs(1000, lens, packed)
+    if remote_packed is None:
+        remote_packed = packed
+    remote_addrs = build_addrs(5000, lens[:n_remote], remote_packed)
 
     t = KVCacheRecvingThread(
         tp_rank=0,
@@ -111,7 +132,7 @@ def make_thread(engine, draft_group_pos=None):
     t.remote_te_port = {"P0": {1111: 7777}}
     t.remote_group_layer_counts = {"P0": {1111: [25, 21, 21, 21]}}
     t.remote_block_stride_per_addr = {
-        "P0": {1111: [GROUP_STRIDES[0]] * 25 + [GROUP_STRIDES[1]] * 50}
+        "P0": {1111: [GROUP_STRIDES[0]] * 25 + [GROUP_STRIDES[1]] * (n_remote - 25)}
     }
     return t
 
@@ -192,8 +213,70 @@ check(
 )
 check("C3 asymmetric: lengths are single pages", set(lens3) == {10, 20}, f"{sorted(set(lens3))}")
 
+# --- Scenario D: packed same-spec groups merge into ONE pull per block-run --
+# Block-outer geometry: each group's layers sit page-consecutive (diffs ==
+# block_len), both sides, symmetric pitch. Group g's whole per-block width
+# is one contiguous span -> single merged tuple (new78 -7.6% xL fix).
+eng4 = FakeEngine()
+t4 = make_thread(eng4, packed=True, n_remote=88)
+t4._transfer_kv_cache_all_groups(
+    req_meta(
+        remote_ids=[[0, 1, 2], [5, 6, 7], [8], [9]],
+        local_ids=[[0, 1, 2], [5, 6, 7], [], [9], [3]],
+    )
+)
+src4, dst4, lens4 = eng4.calls[0]
+# Packed group 0 bases: local 1000+10j, remote 5000+10j -> merged tuple
+# (1000, 5000, 25*10=250, 111, 111). Run [0,1,2]: one entry, len 2*111+250.
+check("D1 exactly one entry per non-empty group", len(src4) == 3, f"{len(src4)} srcs")
+check("D2 group0 merged src/dst", src4[0] == 1000 and dst4[0] == 5000, f"src={src4[0]} dst={dst4[0]}")
+check("D3 group0 merged len = (n-1)*stride + group width", lens4[0] == 2 * 111 + 250, f"len={lens4[0]}")
+# Group 1 (layers 25..45, page 20, stride 222): first base 1000+25*10=1250,
+# remote 5000+250=5250; merged len 21*20=420; run [5,6,7].
+g1 = next(i for i, s in enumerate(src4) if s == 1250 + 5 * 222)
+check("D4 group1 merged src/dst", src4[g1] == 2360 and dst4[g1] == 5250 + 5 * 222, f"dst={dst4[g1]}")
+check("D5 group1 merged len", lens4[g1] == 2 * 222 + 420, f"len={lens4[g1]}")
+# Group 3 (layers 67..87, packed first base 1000+25*10+42*20=2090), block 9.
+g3 = next(i for i, s in enumerate(src4) if s == 2090 + 9 * 222)
+check("D6 group3 single-block merged len = group width", lens4[g3] == 420, f"len={lens4[g3]}")
+# Draft layer (k=88, packed base 1000+25*10+63*20=2510, block 3) absent.
+check(
+    "D7 draft layer never transferred",
+    2510 + 3 * 333 not in src4,
+    f"srcs={sorted(src4)}",
+)
+
+# --- Scenario E: local packed but remote unpacked -> per-layer fallback ------
+# The merge must verify packing on BOTH sides from the exchanged bases; a
+# peer whose layer bases are not page-consecutive falls back to per-layer
+# pulls (byte-identical to pre-patch behavior).
+eng5 = FakeEngine()
+t5 = make_thread(eng5, packed=True, remote_packed=False, n_remote=88)
+t5._transfer_kv_cache_all_groups(
+    req_meta(
+        remote_ids=[[0, 1, 2], [5, 6, 7], [8], [9]],
+        local_ids=[[0, 1, 2], [5, 6, 7], [], [9], [3]],
+    )
+)
+src5, dst5, lens5 = eng5.calls[0]
+# Group 0: 25 per-layer entries, src step 10 (packed local), dst step 1.
+check("E1 fallback entry count = 25+21+21", len(src5) == 67, f"{len(src5)} srcs")
+check(
+    "E2 per-layer src follows packed local bases",
+    1000 in src5 and 1010 in src5 and 1000 + 24 * 10 in src5,
+)
+check("E3 per-layer dst follows unpacked remote bases", 5000 in dst5 and 5001 in dst5)
+check(
+    "E4 per-layer lens unchanged",
+    set(lens5) == {2 * 111 + 10, 2 * 222 + 20, 20},  # last: group 3 single-block runs
+    f"{sorted(set(lens5))}",
+)
+
 print()
 if fails:
     print(f"ALIGN_FAILED: {fails}")
     sys.exit(1)
-print("ALIGN_PASSED: draft-last skip / misorder loud error / asymmetric strides all behave as designed")
+print(
+    "ALIGN_PASSED: draft-last skip / misorder loud error / asymmetric strides / "
+    "packed-group merge / unpacked fallback all behave as designed"
+)

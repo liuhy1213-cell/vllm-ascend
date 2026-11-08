@@ -736,6 +736,124 @@ class KVCacheRecvingThread(threading.Thread):
                     remote_host_ = remote_port_send_num[remote_port]["host"]
                     self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
 
+    def _build_group_addr_views(
+        self,
+        local_addrs: list[int],
+        remote_kv_caches_base_addrs: list[int],
+        block_len_arr: list[int],
+        block_stride_arr: list[int],
+        addr_group_arr: list[set[int]],
+        remote_stride_arr: list[int] | None,
+    ) -> list[list[tuple[int, int, int, int, int]]]:
+        """Per group, the transfer-address views the pull loop iterates.
+
+        Each view tuple is ``(src_base, dst_base, block_len, block_stride,
+        remote_block_stride)`` where ``src`` is the LOCAL destination and
+        ``dst`` the PEER source (see the pull loop's naming note).
+
+        The default view is one tuple per layer — the historical per-layer
+        path. In a block-outer pool every layer's block sits
+        ``block_stride`` (the whole-pool pitch) apart, so a per-layer run
+        pull of ``(n-1)*stride + page`` transfers the same inter-layer span
+        once per layer: measured on new78 PD 2026-11-08 at ~61 GB per 64k
+        request (~84x the useful KV) and -7.6% e2e throughput, because 89
+        layers re-pull one shared row.
+
+        When a group's layers are PACKED in the row — consecutive base
+        differences equal the page size, verified here from the exchanged
+        base addresses, never assumed from the layout — the group's whole
+        per-block footprint is one contiguous span starting at its first
+        layer's base, and the group collapses to a SINGLE tuple whose
+        ``block_len`` is ``layers * page``: one pull per block-run moves
+        every layer of the group at once (~2.9 GB for the same request).
+        Gated on a symmetric peer pitch (asymmetric falls back per block,
+        where a merged span would misaddress one side) and skipped for
+        MambaSpec groups, whose state is not page-packed.
+        """
+        # Address-pair index k pairs local_addrs[k] with remote base k and is
+        # bounded by the SHORTER list — the historical zip() semantics. The
+        # D-side-only draft tail (local one group longer than the peer) must
+        # not leak into per-group views; per-group layer counts are validated
+        # separately by the loud misalignment check above.
+        num_addrs = min(len(local_addrs), len(remote_kv_caches_base_addrs))
+        if not addr_group_arr:
+            # Legacy flat mode: preserve the historical all-addrs-per-group
+            # iteration verbatim (empty addr_group_arr means no filtering,
+            # every group iterates every address).
+            legacy = [
+                (
+                    local_addrs[k],
+                    remote_kv_caches_base_addrs[k],
+                    block_len_arr[k],
+                    block_stride_arr[k],
+                    remote_stride_arr[k] if remote_stride_arr and k < len(remote_stride_arr) else block_stride_arr[k],
+                )
+                for k in range(num_addrs)
+            ]
+            return [legacy for _ in range(self.hma_group_size)]
+
+        views: list[list[tuple[int, int, int, int, int]]] = []
+        for g in range(self.hma_group_size):
+            ks = [k for k in range(num_addrs) if g in addr_group_arr[k]]
+            if (
+                len(ks) <= 1
+                or g >= len(self.kv_cache_specs)
+                or isinstance(self.kv_cache_specs[g], MambaSpec)
+            ):
+                views.append(
+                    [
+                        (
+                            local_addrs[k],
+                            remote_kv_caches_base_addrs[k],
+                            block_len_arr[k],
+                            block_stride_arr[k],
+                            remote_stride_arr[k] if remote_stride_arr and k < len(remote_stride_arr) else block_stride_arr[k],
+                        )
+                        for k in ks
+                    ]
+                )
+                continue
+            block_len = block_len_arr[ks[0]]
+            block_stride = block_stride_arr[ks[0]]
+            packed = (
+                len({block_len_arr[k] for k in ks}) == 1
+                and len({block_stride_arr[k] for k in ks}) == 1
+                and remote_stride_arr is not None
+                and len({remote_stride_arr[k] for k in ks}) == 1
+                and remote_stride_arr[ks[0]] == block_stride
+                and all(
+                    local_addrs[ks[j]] - local_addrs[ks[j - 1]] == block_len
+                    and remote_kv_caches_base_addrs[ks[j]] - remote_kv_caches_base_addrs[ks[j - 1]] == block_len
+                    for j in range(1, len(ks))
+                )
+            )
+            if packed:
+                views.append(
+                    [
+                        (
+                            local_addrs[ks[0]],
+                            remote_kv_caches_base_addrs[ks[0]],
+                            len(ks) * block_len,
+                            block_stride,
+                            block_stride,
+                        )
+                    ]
+                )
+            else:
+                views.append(
+                    [
+                        (
+                            local_addrs[k],
+                            remote_kv_caches_base_addrs[k],
+                            block_len_arr[k],
+                            block_stride_arr[k],
+                            remote_stride_arr[k] if remote_stride_arr and k < len(remote_stride_arr) else block_stride_arr[k],
+                        )
+                        for k in ks
+                    ]
+                )
+        return views
+
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
         remote_request_id = req_meta["remote_request_id"]
@@ -854,6 +972,14 @@ class KVCacheRecvingThread(threading.Thread):
             remote_stride_arr = None
 
         req_start_time = time.perf_counter()
+        group_views = self._build_group_addr_views(
+            local_addrs,
+            remote_kv_caches_base_addrs,
+            block_len_arr,
+            block_stride_arr,
+            addr_group_arr,
+            remote_stride_arr,
+        )
         src_list, dst_list, length_list = [], [], []
         for i in range(num_groups):
             if not remote_block_ids[i] or not local_block_ids[i]:
@@ -867,22 +993,15 @@ class KVCacheRecvingThread(threading.Thread):
             grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
                 cur_remote_block_ids, cur_local_block_ids
             )
-            for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
-                zip(local_addrs, remote_kv_caches_base_addrs)
+            for src_layer_base_addr, dst_layer_base_addr, block_len, block_stride, remote_block_stride in (
+                group_views[i]
             ):
-                if addr_group_arr and i not in addr_group_arr[k]:
-                    continue
-                block_len = block_len_arr[k]
-                block_stride = block_stride_arr[k]
                 # NOTE on naming: batch_transfer_sync_read reads FROM the peer
                 # INTO the local buffers, so ``src_*`` below are LOCAL
                 # destinations and ``dst_*`` are PEER sources. The peer's
                 # buffer must be addressed with the PEER's own stride — using
                 # the local stride misread the producer whenever P/D
                 # bytes_per_block differed (review finding P0-1).
-                remote_block_stride = (
-                    remote_stride_arr[k] if remote_stride_arr and k < len(remote_stride_arr) else block_stride
-                )
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
                     if remote_block_stride == block_stride:
                         # A contiguous block-id run spans (n-1) strides plus
@@ -913,15 +1032,12 @@ class KVCacheRecvingThread(threading.Thread):
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
         if ascend_envs.VLLM_ASCEND_DEBUG_HYBRID_XFER:
             logger.info(
-                "HYBRID-XFER req=%s groups=%d addrs=%d per_group_addrs=%s remote_blocks=%s local_blocks=%s "
+                "HYBRID-XFER req=%s groups=%d addrs=%d per_group_views=%s remote_blocks=%s local_blocks=%s "
                 "srcs=%d lens=%s",
                 remote_request_id,
                 self.hma_group_size,
                 len(local_addrs),
-                [
-                    sum(1 for kk in range(len(local_addrs)) if not addr_group_arr or i in addr_group_arr[kk])
-                    for i in range(self.hma_group_size)
-                ],
+                [len(v) for v in group_views[: self.hma_group_size]],
                 [len(b) for b in remote_block_ids],
                 [len(b) for b in local_block_ids],
                 len(src_list),
