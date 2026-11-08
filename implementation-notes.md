@@ -407,6 +407,22 @@ the recipe is not enabled"，且所有层的注册日志都是 `page=65536 B`（
   **不含 `"MooncakeHybridConnector"`** ⇒ 需加白名单。
 - **其它**：MTP draft 的 C8 归属、block size 对齐、图模式兼容、sink 精度复测。
 
+#### S2 旁证：主干合并树在 SLA V2 部署冒烟 PASS（2026-11-08，A 机 iquest-sla-a）
+
+- 主干 `iquest-q1-pd-quant` @ `f020be6d2`（与最新 `57035a230` 零代码差）以 SLA
+  optimal 参数（TP8、block 128、bf16 KV、MTP n5、graph、async+EP8+MC2）拉起。
+  **SLA 部署走 V2 runner**（`deploy/iquest-sla-throughput/launch_engine.sh:33`
+  `VLLM_USE_V2_MODEL_RUNNER=1`），故本冒烟执行了 V2 混合组分配路径——与
+  单机 V1 冒烟（见 `55d9b7366`）互补。
+- **S1 共享池收益外溢到等页距 SLA 配置**：旧 opt 分支走 "scales the multi-group
+  budget by 0.2921" 私有 buffer 回退（696,673 tokens / 5.32x），合并后该回退消失，
+  KV **2,387,389 tokens（3.43×，恰=1/0.2921）** / 18.21x。
+- 闸门：c28 ×2 = 1,041.6/1,032.1 中位 **1,036.9（+3.9% vs 997.5）**、mTPOT 23.59、
+  零失败、acceptance 34.6%；GSM8K {94,95}（errors=0；失败集与全部历史运行 diff 后
+  钉死 {12,87,93} 慢性失败基线同样中招，零新增推理错，截断抽签 −2 记备注）。
+  数据：`logs/gsm8k/merge_f020be6d2_n100_r{1,2}.jsonl`、`logs/bench/a_mg_c28_r{1,2}.*`。
+- A 机终态 = 主干树（env.sh 指 `vllm-ascend`，opt 行注释保留可回退）。
+
 ### S2-A 算子探针：C8-QFA 滑窗能力 go/no-go（2026-11-08，docs-only）
 
 **假设**：63 滑窗层 C8 是唯一 2.8× 并发杠杆（§2.6），阻塞在
