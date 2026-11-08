@@ -1068,3 +1068,12 @@ connector 的层视图块距（5,505,024 B）大于真页（135,168/262,144）�
 Patch 4 非单机必需）。激活开关：`VLLM_ASCEND_ENABLE_C8_MIXED_OVERLAY=1` +
 V2 runner + `--kv-cache-dtype mxfp8 --kv-cache-dtype-skip-layers sliding_window`
 + block 512。
+
+**8.3 补充（17:2x）——spec 链路真实代码执行闭环**：A 机容器以真实构造链验证——
+`mxfp_cache_spec(FullAttentionSpec(512, Hkv×D=128, bf16))` → `type is FullAttentionSpec`、
+dtype fp8e4m3fn、page=135,168；`SlidingWindowSpec(512, sliding_window=2048)` →
+page=262,144；真实 spec 集过 `_c8_mixed_overlay_true_page_specs` → True（带
+page_size_padded 的 spec → False）；**真实 IQuest 层模式**（4 full + 21×[f,s,s,s] +
+MTP = 26f/63s）喂真实 `_get_kv_cache_groups_uniform_page_size` → **[26,21,21,21]、
+真页 [135,168, 262,144×3]** → bpb=5,505,024=10,752 B/token。整链（spec→门→分组→
+descriptor→分配→视图→清零→connector）全部经真实代码或 66 项几何单测覆盖。
