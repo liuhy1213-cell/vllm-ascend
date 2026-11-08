@@ -624,6 +624,43 @@ def _c8_mixed_overlay_true_page_specs(
     return is_c8_mixed_kv_overlay_enabled(vllm_config)
 
 
+def _get_c8_mixed_overlay_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Bucket the overlay spec set into groups WITHOUT size normalization.
+
+    ``_get_kv_cache_groups_uniform_page_size`` ends with an n:1-pattern
+    heuristic (group size = smallest bucket, then split + pad every bucket to
+    that size) that exists for the uniform shared-page pool. The block-outer
+    overlay does not need equal layer counts across groups - each group
+    aliases the same backing from byte 0 and a block ID belongs to one group
+    at a time - and the heuristic degenerates to one group per layer when a
+    singleton bucket exists (e.g. the MTP draft layer's own
+    ``SlidingWindowSpec(512)``): 89 single-layer groups shatter the pool
+    geometry. So replay only the bucket + merge loop and hand the buckets
+    straight to ``create_kv_cache_group_specs``.
+    """
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        same_type_layers[layer_spec].append(layer_name)
+    layer_buckets: list[list[str]] = []
+    spec_buckets: list[list[KVCacheSpec]] = []
+    for layer_spec, layer_names in same_type_layers.items():
+        for names, specs in zip(layer_buckets, spec_buckets):
+            try:
+                # A raise means that the specs are incompatible.
+                type(specs[0]).merge([*specs, layer_spec])
+            except (AssertionError, ValueError):
+                continue
+            names.extend(layer_names)
+            specs.append(layer_spec)
+            break
+        else:
+            layer_buckets.append(list(layer_names))
+            spec_buckets.append([layer_spec])
+    return vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(kv_cache_spec, layer_buckets)
+
+
 def _get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -634,8 +671,9 @@ def _get_glm5_next_kv_cache_groups(
         # True per-group pages: group by spec type and split by the repeat
         # pattern (25 full C8 layers -> one group; 63 sliding layers -> three
         # 21-layer groups), skipping ``unify_kv_cache_spec_page_size`` which
-        # pads the smaller page back to the max.
-        groups = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+        # pads the smaller page back to the max. Buckets are NOT normalized to
+        # an equal layer count (see _get_c8_mixed_overlay_groups).
+        groups = _get_c8_mixed_overlay_groups(kv_cache_spec)
         vllm.v1.core.kv_cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
         vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(vllm_config, groups)
         group_pages = [
