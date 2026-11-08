@@ -353,7 +353,23 @@ the recipe is not enabled"，且所有层的注册日志都是 `page=65536 B`（
    ⇒ **S2 只有一条可行路线：full + sliding 同时 C8（两组都 32KB），
    收益 ≈ 2×（1.70 → 0.85 MB/block）**；若要分批上，必须先扩展 overlay 支持混合页距。
 
-### S2 【2026-11-08 复核】路径 A 只需要一行判定，不是分配器重写
+### S2 【2026-11-08 更正】"一行判定"捷径被否决，as_strided 设计仍是唯一正确几何
+
+我一度认为"混合页距只需放宽 `can_overlay_attention_kv_groups()` 的相等判定"，
+理由是 LBNHC 下每层仍连续、组间从 byte 0 别名。**该结论错误，已被鸽笼反例否决**：
+
+- full 组（page 33,792）layer0 **block 1** 在 `[33,792, 67,584)`；
+  sliding 组（page 65,536）layer0 **block 0** 在 `[0, 65,536)` ⇒ 重叠 `[33,792, 65,536)`；
+- 这是**两个不同 block id、两组同时活**，调度器的"组间 id 独占"拦不住；
+- 等页距之所以安全，是因为同 id 落同一段字节，混合页距下这个前提消失。
+- 上游注释也写明 layer-outer "only supported for uniform page sizes or single-group models"，
+  `_get_packed_kv_cache_groups` 的 gate 是 `if not layout.is_block_outermost ...: return None`。
+
+⇒ **必须改成 block-outer 几何（`as_strided`，`stride(0)=bytes_per_block`）+ 连接器拆分
+`block_len`/`block_stride` + attention 视图适配**，即设计稿 §3 的原方案。工程量不降。
+错误分支 `feat/iquest-pd-c8-mixed-pages`（`2c2ca4520`）已删除；设计稿已重建（§1 记录该反例）。
+
+### （已作废）旧判断：路径 A 只需要一行判定
 
 初版设计稿（`docs/S2_路径A_混合页距分配器设计稿.md`）假设"混合页距必须改 `as_strided`、
 块间距统一成 `bytes_per_block`"，**假设错误**。重读 vLLM
