@@ -101,6 +101,14 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
     local_ip: str = ""
+    # Per-address block strides and per-group layer counts, exchanged so the
+    # pull side can address the producer's buffer with the producer's own
+    # geometry. Empty means an older peer: the pull side then falls back to
+    # its local strides and warns (pre-2026-11-08 behaviour, which silently
+    # misaddressed the producer whenever P/D bytes_per_block differed —
+    # review finding P0-1).
+    block_strides: list[int] = []
+    group_layer_counts: list[int] = []
 
 
 @dataclass(frozen=True)
@@ -493,6 +501,12 @@ class KVCacheRecvingThread(threading.Thread):
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
+        # Peer geometry exchanged in the handshake (see MooncakeAgentMetadata):
+        # per-address block strides and per-group layer counts, keyed
+        # [engine_id][handshake_port]. Empty lists mean an older peer.
+        self.remote_block_stride_per_addr: dict[str, dict[int, list[int]]] = SizedDict()
+        self.remote_group_layer_counts: dict[str, dict[int, list[int]]] = SizedDict()
+        self._remote_geometry_warned: set[tuple[str, int]] = set()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()))
@@ -789,9 +803,59 @@ class KVCacheRecvingThread(threading.Thread):
                 len(remote_kv_caches_base_addrs),
             )
 
+        # Group structures must be position-aligned: block-id lists are
+        # exchanged per group index. A decode-side-only group (the MTP draft
+        # as its own KV cache group) gives the decoder one more group than the
+        # producer; extra LOCAL groups are skipped (their KV is decode-local,
+        # there is nothing to pull), but a misORDERED extra group would shift
+        # every later group index and silently cross-wire block ids. The
+        # exchanged per-group layer counts turn that into a loud error
+        # (review finding P0-1 follow-up, 2026-11-08).
+        if self._prefill_pp_size <= 1:
+            num_groups = min(self.hma_group_size, len(remote_block_ids), len(local_block_ids))
+            with self.remote_metadata_lock:
+                remote_counts = self.remote_group_layer_counts.get(remote_engine_id, {}).get(remote_handshake_port)
+                remote_stride_arr = self.remote_block_stride_per_addr.get(remote_engine_id, {}).get(
+                    remote_handshake_port
+                )
+            if num_groups < self.hma_group_size:
+                logger.info(
+                    "Hybrid KV transfer: %d local groups but the request lists carry %d remote / "
+                    "%d local entries; groups >= %d are skipped. Decode-side-only groups "
+                    "(e.g. the MTP draft) must sort last.",
+                    self.hma_group_size,
+                    len(remote_block_ids),
+                    len(local_block_ids),
+                    num_groups,
+                )
+            if addr_group_arr and remote_counts:
+                local_counts = [sum(1 for g in addr_group_arr if gi in g) for gi in range(num_groups)]
+                for gi in range(min(num_groups, len(remote_counts))):
+                    if remote_counts[gi] != local_counts[gi]:
+                        raise RuntimeError(
+                            f"Hybrid KV transfer group misalignment: group {gi} has "
+                            f"{local_counts[gi]} transfer addresses locally but "
+                            f"{remote_counts[gi]} on the peer. Group structures must be "
+                            "position-aligned in model-layer order; a decode-side-only "
+                            "group (MTP draft) must sort LAST, otherwise block ids "
+                            "cross-wire between groups."
+                        )
+            if remote_stride_arr is None and (remote_engine_id, remote_handshake_port) not in self._remote_geometry_warned:
+                self._remote_geometry_warned.add((remote_engine_id, remote_handshake_port))
+                logger.warning(
+                    "Peer %s:%d did not exchange block_strides (older build); falling back "
+                    "to the local block stride for peer-side addressing. Correct only "
+                    "when P/D geometries match.",
+                    remote_engine_id,
+                    remote_handshake_port,
+                )
+        else:
+            num_groups = self.hma_group_size
+            remote_stride_arr = None
+
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
-        for i in range(self.hma_group_size):
+        for i in range(num_groups):
             if not remote_block_ids[i] or not local_block_ids[i]:
                 continue
             cur_remote_block_ids = remote_block_ids[i]
@@ -810,18 +874,34 @@ class KVCacheRecvingThread(threading.Thread):
                     continue
                 block_len = block_len_arr[k]
                 block_stride = block_stride_arr[k]
+                # NOTE on naming: batch_transfer_sync_read reads FROM the peer
+                # INTO the local buffers, so ``src_*`` below are LOCAL
+                # destinations and ``dst_*`` are PEER sources. The peer's
+                # buffer must be addressed with the PEER's own stride — using
+                # the local stride misread the producer whenever P/D
+                # bytes_per_block differed (review finding P0-1).
+                remote_block_stride = (
+                    remote_stride_arr[k] if remote_stride_arr and k < len(remote_stride_arr) else block_stride
+                )
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
-                    src = src_layer_base_addr + local_block_id[0] * block_stride
-                    dst = dst_layer_base_addr + remote_block_id[0] * block_stride
-                    # A contiguous block-id run spans (n-1) strides plus one
-                    # page payload. With stride == block_len (every legacy
-                    # layout) this reduces to n * block_len; the mixed-page
-                    # overlay carries a larger stride, so the tail page must
-                    # not be multiplied away.
-                    length = (len(local_block_id) - 1) * block_stride + block_len
-                    src_list.append(src)
-                    dst_list.append(dst)
-                    length_list.append(length)
+                    if remote_block_stride == block_stride:
+                        # A contiguous block-id run spans (n-1) strides plus
+                        # one page payload. With stride == block_len (every
+                        # legacy layout) this reduces to n * block_len; the
+                        # mixed-page overlay carries a larger stride, so the
+                        # tail page must not be multiplied away.
+                        src_list.append(src_layer_base_addr + local_block_id[0] * block_stride)
+                        dst_list.append(dst_layer_base_addr + remote_block_id[0] * block_stride)
+                        length_list.append((len(local_block_id) - 1) * block_stride + block_len)
+                    else:
+                        # Asymmetric pitches: a contiguous run in one layout
+                        # cannot land contiguously in the other. Fall back to
+                        # one transfer per block, each side addressed with its
+                        # own stride (run-local block ids pair by position).
+                        for local_block, remote_block in zip(local_block_id, remote_block_id):
+                            src_list.append(src_layer_base_addr + local_block * block_stride)
+                            dst_list.append(dst_layer_base_addr + remote_block * remote_block_stride)
+                            length_list.append(block_len)
 
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
@@ -1113,6 +1193,12 @@ class KVCacheRecvingThread(threading.Thread):
             with self.remote_metadata_lock:
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
+                self.remote_block_stride_per_addr[engine_id][remote_handshake_port] = list(
+                    agent_meta.block_strides
+                )
+                self.remote_group_layer_counts[engine_id][remote_handshake_port] = list(
+                    agent_meta.group_layer_counts
+                )
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -2091,11 +2177,12 @@ class MooncakeConnectorWorker:
                     "block length."
                 )
             logger.info(
-                "Hybrid KV layout: %d groups, %d transfer addresses, per-group=%s, block_lens=%s",
+                "Hybrid KV layout: %d groups, %d transfer addresses, per-group=%s, block_lens=%s, block_strides=%s",
                 len(self.kv_cache_config.kv_cache_groups),
                 len(self.kv_caches_base_addr),
                 [sum(1 for g in self.addr_group_idx if i in g) for i in range(len(self.kv_cache_config.kv_cache_groups))],
                 sorted(set(self.block_len_per_addr)),
+                sorted(set(self.block_stride_per_addr)),
             )
         else:
             raise TypeError("Mooncake connector does not support this type kv_cache now.")
@@ -2115,6 +2202,15 @@ class MooncakeConnectorWorker:
             kv_caches_base_addr=self.kv_caches_base_addr,
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_addr,
+            block_strides=self.block_stride_per_addr,
+            group_layer_counts=(
+                [
+                    sum(1 for g in self.addr_group_idx if i in g)
+                    for i in range(len(self.kv_cache_config.kv_cache_groups))
+                ]
+                if self.addr_group_idx
+                else []
+            ),
             ssm_sizes=self._mamba_ssm_size,
             local_ip=get_ip(),
         )
