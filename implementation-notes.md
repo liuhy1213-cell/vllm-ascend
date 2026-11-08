@@ -1151,3 +1151,15 @@ descriptor→分配→视图→清零→connector）全部经真实代码或 66 
   raise（128%512≠0 且 user_specified）。Patch 5 同时消掉 128 页与该 raise。
 - **peer 43.87 post-fix 预测锚点**：D3 五组 post-lift bpb=5,505,024（sliding
   钉住，与设计锚点一致），44,596 MiB 池 NB≈8,494（设计 8,496）；待引擎实测对数。
+- **D3 组对齐离线推演（17 上机确认项①提前闭环，2026-11-08 11:4x）**：
+  `tools/s2_path_a/hybrid_connector_group_alignment_test.py` 用假 engine 构造真
+  `KVCacheRecvingThread`，D 5 组/P 4 组三场景 9 项全绿——draft-last：num_groups=4、
+  多余组 info 跳过、draft 层零传输、空组跳过、其余组 run 快路径；draft 错位到组 0：
+  local_counts [1,25,21,21] vs remote [25,21,21,21] → RuntimeError 且零传输；
+  stride 不对称：逐块传输、src 本地 stride / dst **peer** stride、单页长度。
+- **conc 绝对值口径澄清（回应 17 质疑）**：Σ=256+3×41=379 是 **core 公式
+  （kv_cache_utils.py:1067）的 128k max_model_len 满长 worst-case 块记账**（与
+  node6 18.01=A 机 bf16 18.215 同口径），22.42=8,495/379 是该公式下的并发；
+  17 按 64k 实负载+draft 算的 79 是另一种口径，两者不矛盾。**定版的是 ×1.238
+  比值**（C8/bf16-512 基线 NB 比 = 6,815,744/5,505,024，Σ 同块数），绝对并发
+  以启动日志 num_blocks + 各组 page 反推为权威，22.42 不进设计稿当定值。
