@@ -468,18 +468,43 @@ S1+S4 落地后（稳态 8,623 tok/s/卡，TTFT p99 4.72 唯一破项，TPOT 23.
 
 **2026-11-08 实测后的定位（重要）**：
 
-- **每步耗时由常量项（权重流）主导，不是 token 数**：实测论据是 MTP 深度对照 ——
-  n=5 每步 6 token/序列、n=3 每步 4 token/序列，step 时间只从 20.84 变到 23.13 ms，
-  且方向是被 accept 拉低、不是被 token 数拉高。⇒ 元素级优化（标量折叠、lm_head bf16、
-  norm 融合）最多回收个位数百分比，**暂缓**。
-  参考量级：21.35 GiB/卡 ÷ 22 ms ≈ **1.0 TB/s/卡**等效权重流
-  （是否已是 HBM 顶取决于 950DT 实际带宽，**未查手册确认，不作为论据**）。
-  能再提速的只有"少读权重"（更激进量化）或"提高并发"（S2）。
+- **D 侧 profile 已采到（2026-11-08，64k/1k、rank0、628 个 decode step）**：
+  `torch_npu analyse` 的 `op_statistic.csv` 按算子聚合（设备时间）：
+
+  | 桶 | 占比 | ms/step | 主要内容 |
+  |---|---|---|---|
+  | MoE matmul | 29.7% | 7.38 | `GroupedMatmulSwigluQuantV2` 15.5% + `GroupedMatmul` 14.2%（MC2，含通信） |
+  | attention | 25.2% | 6.26 | `FusedInferAttentionScore`（64k 上下文、滑窗层读 4096 窗口） |
+  | elementwise | 17.4% | 4.32 | Slice 2.3% / Cumsum 1.5% / rope 1.4% / Cast 1.3% / muls_add 1.2% / Muls 1.2% / RealDiv 1.1% / sink_apply 1.0% … |
+  | norm | 8.2% | 2.05 | `RmsNorm` × 5/层（含 2 个 QK-norm） |
+  | routing | 7.6% | 1.89 | `MoeInitRoutingV3` 4.4% / `MoeFinalizeRoutingV2` 1.8% / `MoeGatingTopK` 1.4% |
+  | 其它 matmul | 7.4% | 1.85 | QKV/o_proj/lm_head |
+  | quant | 4.5% | 1.13 | `DynamicMxQuant` |
+
+  **单步设备时间 24.87 ms**（15.61 s / 628 step），与 TPOT 20.8–23.5 ms 同量级。
+
+- **修正**：此前"每步由权重流主导、S3 只剩 2–5%"的说法**过于绝对**。profile 显示
+  纯 matmul 只占 37%，attention 25%，**非 matmul 的 elementwise+norm+routing+quant 合计 38%**
+  （高于计划引用的短上下文画像 elementwise 13.9%）。所以 S3 仍有面，但**每一项都是 1–4%**：
+  单点最大的是 `RmsNorm` 8.2%（两个 QK-norm 是其中 2/5，而 `enable_iquest_triton_qk_norm`
+  的 A/B 已实测无收益）与 routing 三件套 7.6%。
+  ⇒ 结论不变（性价比低、均在噪声边缘），但**依据从"带宽顶死"改为"单项占比小"**。
+  MTP 深度对照的另一条证据仍成立：每步成本对 token 数不敏感（n=5 与 n=3 的 step 只差 2.3 ms，
+  且方向由 accept 决定）⇒ verify 侧没有 token 数带来的额外空间。
+- **attention 25% 是最值得动的单点，但被 S2 的算子结论锁死**（滑窗层没法读 C8）；
+  full 组 C8 只能削掉其中约 25/26 的一部分 ⇒ 与 S2 的 1.27× 是同一件事。
 - **两个 -prof 开关**（第 1 条）：已 A/B，rate 1.8 下 4,845/5,095 vs 对照 5,008/5,122 ——
   噪声内无收益，默认关（`S3_EXTRA=0`）。
 - **MTP 深度**：n=3 vs n=5 实测 6,448 vs 6,388 但 TPOT 23.13 vs 20.84 ⇒ **n=5 更优**。
   accept 在 n=3 仍有 2.44–2.61（n=5 是 2.31–2.74）⇒ draft 收益前 2–3 个 token 就饱和，
   而 verify 的权重流是常数 ⇒ 深度越浅越亏。
+
+0. **profile 采集通路已打通**（new78）：`serve_cmd.sh` 增加通用 `DECODE_EXTRA_ARGS` 透传，
+   `env.override.sh` 写 `--profiler-config {"profiler":"torch","torch_profiler_dir":"/pd/logs/profile",
+   "torch_profiler_with_stack":false}`。采集：热身 → `POST :7100/start_profile` →
+   `bench_inner_pd.sh 1 60`（rate 2.0）→ `POST :7100/stop_profile` → 8 rank × 1.4 GB 落在
+   `logs/profile/`。分析须**先拷到容器本地盘再 `torch_npu.profiler.profiler.analyse`**
+   （SFS 上 IO-bound）。P 侧未开 profiler（`/start_profile` 404），step 归因只需 D 侧。
 
 1. `-prof` 已有但 new78 未开的两项：`enable_fused_o_proj_ar`、`enable_iquest_triton_qk_norm`。
 2. **标量折叠**（`model.py:536-549`；config 实测 `attn_out_scale=1.0`、
