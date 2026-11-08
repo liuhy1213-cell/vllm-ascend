@@ -622,6 +622,13 @@ def _c8_mixed_overlay_true_page_specs(
         # A padded spec means the uniform-page lift still ran; keep the
         # upstream path rather than mixing geometries.
         return False
+    # Mirror the worker-side overlay predicate (can_overlay_attention_kv_groups):
+    # it refuses non-compact layouts, and if the planner disagreed the worker
+    # would fall back to private per-layer buffers while this side still emits
+    # block-outer descriptors (review finding P0-2/P1, 2026-11-08).
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if not (layout.is_layer_compact and layout.is_block_compact):
+        return False
     return is_c8_mixed_kv_overlay_enabled(vllm_config)
 
 
@@ -844,6 +851,53 @@ def _get_c8_mixed_overlay_kv_cache_config(
     )
 
 
+def _c8_mixed_overlay_groups_eligible(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """Config-side mirror of ``_c8_mixed_overlay_true_page_specs``.
+
+    The dispatch sees groups (post-grouping) while the grouping gate sees the
+    raw spec dict; both must apply the SAME conditions, otherwise the config
+    side can emit block-outer descriptors for a geometry the grouping side
+    never validated (review finding P1, 2026-11-08: the previous config-side
+    check matched any fp8 full-attention group and ignored page diversity,
+    spec types, page padding and layout compactness — a grouping fallback
+    would then leave overlay descriptors describing groups the overlay never
+    produced).
+    """
+    from vllm_ascend.utils import is_c8_mixed_kv_overlay_enabled
+
+    if not kv_cache_groups:
+        return False
+    specs: list[KVCacheSpec] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            specs.extend(group_spec.kv_cache_specs.values())
+        else:
+            specs.append(group_spec)
+    if not specs or len({s.page_size_bytes for s in specs}) <= 1:
+        return False
+    if not any(
+        type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn for spec in specs
+    ):
+        return False
+    if not all(type(spec) in (FullAttentionSpec, SlidingWindowSpec) for spec in specs):
+        return False
+    if any(getattr(spec, "page_size_padded", None) is not None for spec in specs):
+        return False
+    if any(
+        spec.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn) for spec in specs
+    ):
+        # Same dtype envelope the worker-side overlay predicate enforces.
+        return False
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if not (layout.is_layer_compact and layout.is_block_compact):
+        return False
+    return is_c8_mixed_kv_overlay_enabled(vllm_config)
+
+
 def _ascend_get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -859,18 +913,11 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
-    from vllm_ascend.utils import is_c8_mixed_kv_overlay_enabled
-
     if is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
-    elif any(
-        type(_get_per_layer_spec(group, group.layer_names[0])) is FullAttentionSpec
-        and _get_per_layer_spec(group, group.layer_names[0]).dtype == torch.float8_e4m3fn
-        for group in kv_cache_groups
-        if group.layer_names
-    ) and is_c8_mixed_kv_overlay_enabled(vllm_config):
+    elif _c8_mixed_overlay_groups_eligible(vllm_config, kv_cache_groups):
         kv_cache_config = _get_c8_mixed_overlay_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif not _is_deepseek_v4_groups(kv_cache_groups):
         kv_cache_config = _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)

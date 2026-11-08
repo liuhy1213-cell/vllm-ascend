@@ -1947,6 +1947,21 @@ def _reshape_kv_cache_v2(
                 # geometry from the config instead of the slice length.
                 total_bytes = raw_cache.numel()
                 page_stride_bytes = overlay_pitch
+                # Guard the overlay assumption itself: the slice must host
+                # (num_blocks - 1) full pitches plus one page. If the allocator
+                # ever fell back to private per-layer buffers while the
+                # descriptors still carry a block-outer stride, the first
+                # out-of-slot write would corrupt a neighbouring layer and the
+                # last would run off the allocation - fail loudly instead.
+                if total_bytes < (kv_cache_config.num_blocks - 1) * overlay_pitch + kv_cache_spec.page_size_bytes:
+                    raise ValueError(
+                        f"KV cache for {layer_name} cannot host the block-outer "
+                        f"overlay geometry: slice has {total_bytes} bytes, but "
+                        f"{kv_cache_config.num_blocks} blocks at stride "
+                        f"{overlay_pitch} plus one "
+                        f"{kv_cache_spec.page_size_bytes}-byte page need "
+                        f"{(kv_cache_config.num_blocks - 1) * overlay_pitch + kv_cache_spec.page_size_bytes}."
+                    )
             else:
                 # Attention and Mamba use independent logical views over one
                 # physical padded-page geometry.
