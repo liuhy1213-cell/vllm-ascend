@@ -502,6 +502,24 @@ S1+S4 落地后（稳态 8,623 tok/s/卡，TTFT p99 4.72 唯一破项，TPOT 23.
 ④ 数字修正：×1.238、num_blocks 40,314→≈49,900（单测算得 49,912）、P/D 在途
   ~59/~83。验收清单第 1 步已完成，下一步=第 2 步启动容量（需上机窗口）。
 
+**"一行判定"捷径否决（2026-11-08，17 提出复核结论，经 vLLM 源码+单测 §F 否决）**：
+17 提出 layer-outer 下 descriptor 自带每层 NB×page 连续段、`allocate_shared_attention_
+kv_cache` 三项校验（layer_stride==NB×page、block_stride==page、end≤backing）在混合
+页距下全过 ⇒ 只需去掉 can_overlay 相等判定、无需 as_strided/连接器。**否决依据**：
+vLLM `kv_cache_utils.py:1756-1768` 构造注释明言 layer-outer 组间别名 "only supported
+for uniform page sizes or single-group models"；`:1979-1995` `_get_packed_kv_cache_
+groups` 把全部混合页距机制 gate 在 `is_block_outermost` 之后。几何：layer-outer 下
+两组从 byte 0 别名，页网格 33,792 与 65,536 从 0 起交错 ⇒ 任意跨组活页相撞
+（full 层0 blk1 [33,792,67,584) 与 sliding 层0 blk0 [0,65,536) 实测重叠
+[33,792,65,536)，单测 §F）；**组间块 id 独占救不了**（撞的是不同 id，且两组活块
+都成千上万、鸽笼必撞）。等页距下不同 id 不撞（§F 对照）=今天部署安全的原因，
+也正是 attn_utils.py:1008 相等判定存在的理由。17 对的部分：校验确实全过、代码会
+"跑起来"——但跑起来≠布局正确，跨组静默互踩恰好是该判定要拦的事。
+**结论：路径 A 仍需原稿 §3 槽位几何（as_strided + 连接器 block_len/block_stride
+拆分 + attention 视图适配），工程量不降**；单测 §D/§E 是路径 A 的目标几何验证，
+不是"将来切 block-outer"的假设基线。验证顺序建议（先单机无 PD 跑通 C8 算子 +
+GSM8K + sink，再上 PD）成立并采纳——分配器风险与算子风险相互独立。
+
 ### S3 D 侧步进
 
 **2026-11-08 实测后的定位（重要）**：
