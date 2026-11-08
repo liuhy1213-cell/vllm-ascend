@@ -802,7 +802,24 @@ rate 2.2 能到 2.12 req/s / 8,623，但 TTFT p99 4.72 s 已破线 ⇒ **可运�
 
 ---
 
-## 6. 参考
+## 6. 阶段沉淀索引（2026-11-08）
+
+| 想看什么 | 去哪 |
+|---|---|
+| 一页纸结论 / 交付物 / 未完成项 | `docs/PD_hybrid_kv_优化报告.md` §0 |
+| 逐阶段实测与负结果 | 本文件 §3–§4 |
+| 怎么复现（起停、压测、精度、profile） | 报告 §7 + 本文件 §3.3 的 profile 通路 |
+| 合并到主干要做什么 | `docs/PD_hybrid_kv_回合主干清单.md`（22 提交 + §2.1 合并记录） |
+| S2 还剩什么、怎么验 | `docs/S2_路径A_混合页距分配器设计稿.md`（§4 六步清单） |
+| 踩过的坑（12 条） | 本文件 §5 |
+
+**给下一个人的三句话**：
+1. hybrid 打开后 **D 侧 KV 从 1.07M 涨到 4.51M tokens** 是这一轮的全部来源，它由三处代码缺口
+   和两个配置开关换来的（§3.3 / §3.2）；
+2. **rate 1.8 是运营点，rate 2.0 是过载点** —— 短跑看不出差别，长跑队列会发散（§4）；
+3. 正确性闸门**不能用文本相等**，要用首 token logprob（≤0.1 nat）；KV 错位时差 2–3 nat。
+
+## 7. 参考
 
 - 计划全文（本分支）：见工作区 `docs/` 与本文件。
 - 方法论：`cannbot-skills/model/model-infer-{profiling,perf-breakdown,kvcache,graph-mode,spec-decode-graph,parallel-analysis,quantization,fusion,multi-stream,prefetch}/`
