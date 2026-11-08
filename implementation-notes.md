@@ -643,6 +643,11 @@ GSM8K {94,95} 零新增推理错。
 | + `0f2dfc0c2`（FIA v2 draft replay key names） | ✅ 首请求正常、三次 greedy 输出一致、引擎侧 EE1006/RuntimeError **0** |
 
 ⇒ **生产同步的最小提交集不止一个**；推荐直接切主干（`460ae8a7e`，三形态均已验证）。
+
+**生产已上线（2026-11-08 13:55，用户授权走"切主干"）**：两侧引擎按
+`master → decode → prefill → proxy` 顺序重启（池化下 master 必须先起，否则 D 侧
+`Initialize mooncake failed`），P/D/proxy 均 200；4 次冒烟全正常（3 次同 prompt 输出一致）、
+两侧错误计数 0、D 侧 KV 1,074,944 tokens（生产仍 hybrid off）、P→D 传输正常。
 详见 `docs/PD_hybrid_kv_回合主干清单.md` §2.2。
 
 ### S4 W4A4C8
