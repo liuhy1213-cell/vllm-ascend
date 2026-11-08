@@ -435,13 +435,15 @@ overlay 要求各组每层 page_size 相等），滑窗 C8 的端到端链条断
 ①P 侧 prefill（T>1，chunk 8192 > mask 网格 2048，无 win 参数）无精确算子路径读
 C8 滑窗缓存 ⇒ P 滑窗必须 bf16；②connector 裸拷贝块字节 ⇒ P bf16 / D C8 的滑窗
 传输会把 bf16 字节写进 C8 缓存（除非 quantize-on-send，大改造）；③滑窗组保持
-bf16 ⇒ bytes_per_block 被 sliding bf16 组（21 层 × 64KB = 1.342MB）钉住。
+bf16 ⇒ bytes_per_block 被 sliding bf16 组（21 层 × 65,536 B = 1,376,256 B）钉住。
 
 **S2 修订范围（替代上文结论 3 的"2.8× 杠杆无阻塞"表述）**：full 组 C8 两侧 +
-混合页距 allocator（full 32KB / sliding 64KB 下 `can_overlay_attention_kv_groups()`
+混合页距 allocator（full ~32KB / sliding 64KB 下 `can_overlay_attention_kv_groups()`
 按层相等判定必 False，是新的关键路径）+ 滑窗保持 bf16（S1 逻辑不动）⇒
-bytes_per_block 1.704 → 1.342MB，**P/D 池 ~1.27×**（P 48→~61、D 67→~85 在途），
-吞吐封顶 +27%、TTFT 队列 −21%。full-C8 为**首次生产 C8**（CLAUDE.md 坑 #7：
+bytes_per_block 1,703,936 → 1,376,256 B（日志锚定：每层 page=65,536 B，D 侧
+num_blocks=40,314；此前写的 1.342MB/1.27× 是 KB/KiB 滑倒，21×65,536=1,376,256），
+**P/D 池 ~1.24×**（P 48→~59、D 67→~83 在途），吞吐封顶 +24%、TTFT 队列 −19%。
+full-C8 为**首次生产 C8**（CLAUDE.md 坑 #7：
 C8 KV 从未真跑过；full 层 prefill TND 同为首次）⇒ 精度三件套（GSM8K ≥95 raw +
 sink 复测 + 长稳）是硬闸门。窗口即视图探针价值重定位：D 侧滑窗 C8 的算子前置
 已验证，但端到端被 ①②锁死——留作 CANN 修 mode4 或传输量化落地后的现成方案，
@@ -457,12 +459,23 @@ S1+S4 落地后（稳态 8,623 tok/s/卡，TTFT p99 4.72 唯一破项，TPOT 23.
 - **S2 = 唯一剩下的量级可观结构性杠杆**，两个独立解锁条件，收益二选一取大：
   | 解锁条件 | 范围 | 收益 |
   |---|---|---|
-  | A：混合页距 allocator（`can_overlay_attention_kv_groups()` 支持 per-group page） | full 组 C8、滑窗 bf16 | P/D 池 ~1.27×（吞吐封顶 +27%，TTFT 队列 −21%） |
-  | B：CANN 支持 mode4（或 win 参数出 mode4） | 两组同时 C8（每层 page 均 32KB ⇒ overlay 相等判定自然成立，**无需 allocator 改造**）+ D 侧窗口即视图已验证 + P 侧 prefill 滑窗走 mode4 | **P/D 池 2×**，TTFT 破项修复 |
+  | A：混合页距 allocator（`can_overlay_attention_kv_groups()` 支持 per-group page） | full 组 C8、滑窗 bf16 | P/D 池 ~1.24×（吞吐封顶 +24%，TTFT 队列 −19%；bpb 1,703,936→1,376,256 B，sliding 21×65,536 钉住） |
+  | B：CANN 支持 mode4（或 win 参数出 mode4） | 两组同时 C8（每层 page 均 ~33.8KB——C8 packet 含 scale 实测 33,792 B ⇒ overlay 相等判定自然成立，**无需 allocator 改造**）+ D 侧窗口即视图已验证 + P 侧 prefill 滑窗走 mode4 | **P/D 池 ≈1.94×**（bpb=26×33,792=878,592 B），TTFT 破项修复 |
   当前卡点：A 难在分配器（layer-outer 单一 backing 下混合页距会 offset 互压）；
   B 难在 CANN kernel（tiling 硬拒，本节探针已存证）。
 - 精度闸门（任一解锁后）：GSM8K ≥95（raw）+ sink attention 复测（quant/README
   坑 #7）+ 长稳；当前 95/96 为 bf16 KV 对照基线。
+
+**路径 A 评估完成（2026-11-08，17 出设计稿、本会话评估）**：
+`docs/S2_路径A_混合页距分配器设计稿.md`（工作区 docs）+ 离线单测
+`docs/s2_path_a_allocator_unit_test.py`（22 项全绿，无 NPU）。结论：
+① 布局成立——槽位边界/组内不相交/跨槽位不外溢/容量核算全过；
+② 连接器改造比稿子初版更必须：交错判定失败后掉进 disjoint 分支会把 K/V 重叠视图
+  当独立区域注册（span 覆盖整段 backing）→ 注册冲突；"块距=块长"假设落点在
+  `block_stride_per_addr.extend(self.block_len_per_addr)`（:1996）；
+③ 退化安全：等页距旧布局下旧判定仍为 True、block_len==block_stride（单测 §E）；
+④ 数字修正：×1.238、num_blocks 40,314→≈49,900（单测算得 49,912）、P/D 在途
+  ~59/~83。验收清单第 1 步已完成，下一步=第 2 步启动容量（需上机窗口）。
 
 ### S3 D 侧步进
 
@@ -492,7 +505,7 @@ S1+S4 落地后（稳态 8,623 tok/s/卡，TTFT p99 4.72 唯一破项，TPOT 23.
   MTP 深度对照的另一条证据仍成立：每步成本对 token 数不敏感（n=5 与 n=3 的 step 只差 2.3 ms，
   且方向由 accept 决定）⇒ verify 侧没有 token 数带来的额外空间。
 - **attention 25% 是最值得动的单点，但被 S2 的算子结论锁死**（滑窗层没法读 C8）；
-  full 组 C8 只能削掉其中约 25/26 的一部分 ⇒ 与 S2 的 1.27× 是同一件事。
+  full 组 C8 只能削掉其中约 25/26 的一部分 ⇒ 与 S2 的 1.24× 是同一件事。
 - **两个 -prof 开关**（第 1 条）：已 A/B，rate 1.8 下 4,845/5,095 vs 对照 5,008/5,122 ——
   噪声内无收益，默认关（`S3_EXTRA=0`）。
 - **MTP 深度**：n=3 vs n=5 实测 6,448 vs 6,388 但 TPOT 23.13 vs 20.84 ⇒ **n=5 更优**。
