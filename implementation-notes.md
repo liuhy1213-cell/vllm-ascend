@@ -634,7 +634,16 @@ overlay 分配只在 V2 runner（PD 部署）生效，那条路径已由 new78 �
 ——S1 的共享池分配修复在等页距（非 PD）配置上也生效；c28 中位 1,036.9（+3.9%）、
 GSM8K {94,95} 零新增推理错。
 
-未做：生产 EE1006 冒烟（未获授权）。
+**生产同步演练（2026-11-08，备用机，未动生产）**：在生产基线 `1b88fd5c8` 的独立 worktree 上，
+用生产同款配置（W8A8C8 + MTP n=5 + `FULL_DECODE_ONLY` 图 + block 128 + util 0.94）起单机：
+
+| 提交集 | 首个真实请求 |
+|---|---|
+| + `7f45a2c5d`（KV 拷贝） | ❌ `RuntimeError: Unknown keyword argument 'actual_seq_lengths' for operator npu_fused_infer_attention_score_v2`（MTP + 图模式的 FIA v2 draft replay） |
+| + `0f2dfc0c2`（FIA v2 draft replay key names） | ✅ 首请求正常、三次 greedy 输出一致、引擎侧 EE1006/RuntimeError **0** |
+
+⇒ **生产同步的最小提交集不止一个**；推荐直接切主干（`460ae8a7e`，三形态均已验证）。
+详见 `docs/PD_hybrid_kv_回合主干清单.md` §2.2。
 
 ### S4 W4A4C8
 
