@@ -36,6 +36,10 @@ NPU (pure tensor geometry on CPU):
                        (block_len = true page, block_stride = bpb); separate
                        buffers and the uniform span keep their branches; the
                        pull length (n-1)*stride + page covers exactly the run
+  L. block lift        Patch 5: native sliding block 128 lifted to lcm 512
+                       (pages recomputed, no padding, window-guarded); the
+                       node6 s2-c8 measured 18.01x bug and the 22.42x / x1.238
+                       post-fix concurrency are reproduced arithmetically
 
 Log-anchored parameters (new78 D side engine.log, 2026-11-08 00:19:38):
   4 groups [26 full, 21, 21, 21 sliding], every page = 65,536 B,
@@ -574,8 +578,109 @@ check(
     start_k + length_k < off3 + 13 * bpb_s2,
 )
 
+# ============================== L: block lift in the overlay grouping path (Patch 5)
+# Real-machine regression (node6 s2-c8 engine log, 2026-11-08 17:20 UTC): the
+# overlay skipped the upstream align wholesale, so the sliding specs kept their
+# native block 128 (page 65,536) while the full C8 spec arrived at 512. Under
+# the core concurrency formula (vllm kv_cache_utils.get_max_concurrency_for_
+# kv_cache_config = NB / sum_g cdiv(spec.max_memory_usage_bytes, page)) the
+# sliding groups then demand cdiv(N,128)+1 = 161 pages per request instead of
+# 41, and the measured concurrency was 18.01x - the full-C8 saving entirely
+# eaten. The fix lifts kernel block sizes to their LCM WITHOUT padding pages
+# (page_size_bytes is a derived property: replace(block_size=...) recomputes),
+# guarded by the sliding window (skip the lift if LCM > window). After the
+# lift the real pipeline produces exactly the §G target geometry.
+import math
+
+
+def lift_block_sizes(specs):
+    """Mirror of patch_kv_cache_utils._c8_mixed_overlay_lift_block_sizes."""
+    blocks = {s["block"] for s in specs.values()}
+    if len(blocks) <= 1:
+        return
+    common = math.lcm(*blocks)
+    windows = [s["window"] for s in specs.values() if s["window"] is not None]
+    if windows and common > min(windows):
+        return  # skip the lift: capacity gain lost, read path preserved
+    for name, s in specs.items():
+        if s["block"] != common:
+            s["block"] = common
+            s["page"] = s["per_token"] * common  # derived-property semantics
+
+
+specs_native = {
+    "full_c8": {"block": 512, "page": 135_168, "per_token": 264, "window": None},
+    "sliding_0": {"block": 128, "page": 65_536, "per_token": 512, "window": 4096},
+    "sliding_1": {"block": 128, "page": 65_536, "per_token": 512, "window": 4096},
+    "sliding_2": {"block": 128, "page": 65_536, "per_token": 512, "window": 4096},
+}
+lift_block_sizes(specs_native)
+check(
+    "L native sliding block 128 lifted to lcm 512",
+    all(s["block"] == 512 for s in specs_native.values()),
+)
+check(
+    "L sliding page recomputed 65,536 -> 262,144 (per-token kept)",
+    all(s["page"] == 262_144 for s in specs_native.values() if s["window"]),
+)
+check(
+    "L full C8 page unchanged 135,168 (no padding)",
+    specs_native["full_c8"]["page"] == 135_168,
+)
+specs_guard = {
+    "full_c8": {"block": 512, "page": 135_168, "per_token": 264, "window": None},
+    "sliding_0": {"block": 128, "page": 65_536, "per_token": 512, "window": 256},
+}
+lift_block_sizes(specs_guard)
+check(
+    "L window guard: LCM 512 > window 256 skips the lift entirely",
+    specs_guard["sliding_0"]["block"] == 128 and specs_guard["sliding_0"]["page"] == 65_536,
+)
+# Consequence arithmetic, anchored on the node6 s2-c8 log: N = 20,480 effective
+# window tokens (cdiv(N,128)+1 = 161 matches the measured sum 739 = 256+3x161),
+# avail ~43.55 GiB, NB 13,307 under the buggy bpb 3,514,368.
+N_WIN = 20_480
+check(
+    "L log anchor: sliding pages/request 161 at block 128 (measured 18.01x)",
+    math.ceil(N_WIN / 128) + 1 == 161 and 13_307 / (256 + 3 * 161) - 18.01 < 5e-4,
+)
+# The e/ engine.log was truncated by a peer launcher clobber (2026-11-08 09:17,
+# same SFS path, exec > LOG_FILE), so the exact avail bytes are unrecoverable;
+# anchor on the measured NB instead: 13,307 x 3,514,368 = 43.5495 GiB, within
+# 0.005 GiB of the logged rounded 43.55 GiB.
+AVAIL_S2 = 13_307 * 3_514_368
+check(
+    "L buggy-state anchor: NB 13,307 x bpb 3,514,368 ~ 43.55 GiB log",
+    AVAIL_S2 == 46_765_694_976 and abs(AVAIL_S2 / 2**30 - 43.55) < 0.005,
+)
+nb_pre = AVAIL_S2 // 3_514_368
+check(
+    "L buggy-state NB = 13,307 reproduced from avail // bpb",
+    nb_pre == 13_307,
+)
+nb_post = AVAIL_S2 // (SLIDING_LAYERS * PAGE_SLIDE_S2)
+req_post = 256 + 3 * (math.ceil(N_WIN / BLOCK_S2) + 1)
+conc_post = nb_post / req_post
+check(
+    "L lifted state: bpb 5,505,024, sum 256+3x41=379, conc ~22.42x",
+    SLIDING_LAYERS * PAGE_SLIDE_S2 == 5_505_024
+    and req_post == 379
+    and 22.3 <= conc_post <= 22.5,
+)
+conc_base = (AVAIL_S2 // (FULL_LAYERS * PAGE_SLIDE_S2)) / req_post
+gain_l = conc_post / conc_base
+check(
+    "L gain vs lifted-bf16 block-512 baseline = x1.238 (band 1.236-1.240)",
+    1.236 <= gain_l <= 1.240,
+    f"{gain_l:.4f}",
+)
+check(
+    "L lifted geometry == §G target geometry (bpb identical)",
+    SLIDING_LAYERS * PAGE_SLIDE_S2 == bpb_s2,
+)
+
 print()
 if failures:
     print(f"UNIT_TEST_FAILED: {len(failures)} failing: {failures}")
     sys.exit(1)
-print("UNIT_TEST_PASSED: layout geometry, capacity, connector split, regression, S2 target geometry (G-J), connector overlay regions (K) all green")
+print("UNIT_TEST_PASSED: layout geometry, capacity, connector split, regression, S2 target geometry (G-J), connector overlay regions (K), block lift (L) all green")

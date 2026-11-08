@@ -681,6 +681,54 @@ def _get_c8_mixed_overlay_groups(
     return vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(kv_cache_spec, layer_buckets)
 
 
+def _c8_mixed_overlay_lift_block_sizes(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> None:
+    """Lift heterogeneous kernel block sizes to their LCM, keep true pages.
+
+    The platform hook skips the upstream ``_align_heterogeneous_kv_block_size``
+    wholesale, but that call does two unrelated things: lift kernel block
+    sizes across spec kinds AND pad pages to a shared size. The overlay needs
+    only the lift. Without it the sliding specs keep their native block (128
+    on IQuest, regardless of ``--block-size``), so a 131,072-token request
+    demands ``cdiv(N, 128) + 1 = 161`` sliding pages per group instead of 41,
+    which measured 18.01x max concurrency on Ascend 950DT (2026-11-08, node6
+    s2-c8 engine log) - the full-C8 saving entirely eaten by sliding block
+    demand. With the lift: sliding pages 512 x 512 = 262,144, bpb
+    max(26 x 135,168, 21 x 262,144) = 5,505,024, and the concurrency lands at
+    the design doc's 1.238x over the lifted-bf16 block-512 baseline.
+
+    Mutates ``kv_cache_spec`` in place so every downstream consumer (groups,
+    block-size resolution, backend builders) sees one geometry.
+    ``page_size_bytes`` is a derived property on the spec dataclasses, so
+    ``replace(block_size=...)`` recomputes pages; ``page_size_padded`` stays
+    unset, which keeps the no-padding contract of this mode. If the LCM ever
+    exceeded a sliding window, the lift is skipped entirely (capacity gain
+    lost, read path preserved) rather than mixing block sizes.
+    """
+    blocks = {spec.block_size for spec in kv_cache_spec.values()}
+    if len(blocks) <= 1:
+        return
+    common = math.lcm(*blocks)
+    windows = [
+        spec.sliding_window
+        for spec in kv_cache_spec.values()
+        if type(spec) is SlidingWindowSpec
+    ]
+    if windows and common > min(windows):
+        logger.warning(
+            "C8 mixed-page KV overlay: skip block lift to %d, sliding window "
+            "%d is smaller; sliding groups keep their native block and the "
+            "capacity gain is reduced.",
+            common,
+            min(windows),
+        )
+        return
+    for name, spec in kv_cache_spec.items():
+        if spec.block_size != common:
+            kv_cache_spec[name] = replace(spec, block_size=common)
+
+
 def _get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -688,12 +736,16 @@ def _get_glm5_next_kv_cache_groups(
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
     if _c8_mixed_overlay_true_page_specs(vllm_config, kv_cache_spec):
-        # True per-group pages: bucket by exact spec value (the draft's own
-        # 512-window spec stays a singleton group) and split the sliding
-        # bucket by within-run position (63 sliding layers -> three 21-layer
-        # groups), skipping ``unify_kv_cache_spec_page_size`` which pads the
-        # smaller page back to the max. Buckets are NOT normalized to an
-        # equal layer count (see _get_c8_mixed_overlay_groups).
+        # True per-group pages: lift kernel block sizes to their LCM (the
+        # sliding specs arrive with their native 128-token block and would
+        # otherwise inflate per-request sliding block demand 4x), then bucket
+        # by exact spec value (the draft's own 512-window spec stays a
+        # singleton group) and split the sliding bucket by within-run
+        # position (63 sliding layers -> three 21-layer groups), skipping
+        # ``unify_kv_cache_spec_page_size`` which pads the smaller page back
+        # to the max. Buckets are NOT normalized to an equal layer count
+        # (see _get_c8_mixed_overlay_groups).
+        _c8_mixed_overlay_lift_block_sizes(kv_cache_spec)
         groups = _get_c8_mixed_overlay_groups(vllm_config, kv_cache_spec)
         vllm.v1.core.kv_cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
         vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(vllm_config, groups)
