@@ -736,6 +736,26 @@ def _c8_mixed_overlay_lift_block_sizes(
             kv_cache_spec[name] = replace(spec, block_size=common)
 
 
+def _has_singleton_draft_bucket(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> bool:
+    """True when the spec set has a singleton bucket under speculative decode.
+
+    That is exactly the shape the upstream n:1 heuristic degenerates on: it
+    takes ``group_size = min(bucket layer counts)``, so a one-layer bucket
+    collapses the whole model into one group per layer (89 on IQuest-Q1 with
+    the MTP draft's own ``SlidingWindowSpec(512)``), which the connector
+    group reconciliation then rejects against the producer's grouped layout.
+    """
+    if getattr(vllm_config.speculative_config, "method", None) is None:
+        return False
+    counts: dict[KVCacheSpec, int] = {}
+    for spec in kv_cache_spec.values():
+        counts[spec] = counts.get(spec, 0) + 1
+    return 1 in counts.values() and len(counts) > 1
+
+
 def _get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -768,6 +788,26 @@ def _get_glm5_next_kv_cache_groups(
             len(kv_cache_spec),
             len(groups),
             group_pages,
+        )
+        return groups
+    if _has_singleton_draft_bucket(vllm_config, kv_cache_spec):
+        # The upstream n:1 heuristic takes group_size = min(bucket layer
+        # counts); the eagle draft's own spec (the D3 SlidingWindowSpec(512)
+        # singleton) drives that minimum to 1 and shatters the model into
+        # one group per layer, which the connector reconciliation then
+        # rejects against the producer's grouped layout. Bucket by exact
+        # spec value instead — the same grouping the C8 overlay path uses,
+        # with the draft bucket last (registered last) and no C8 geometry
+        # involved: pages here are uniform bf16, the overlay gate is off.
+        groups = _get_c8_mixed_overlay_groups(vllm_config, kv_cache_spec)
+        vllm.v1.core.kv_cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+        vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(vllm_config, groups)
+        logger.info(
+            "Hybrid grouping with singleton draft bucket: %d layers into "
+            "%d groups %s",
+            len(kv_cache_spec),
+            len(groups),
+            [len(group.layer_names) for group in groups],
         )
         return groups
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
