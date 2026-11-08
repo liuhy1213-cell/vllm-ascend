@@ -62,6 +62,7 @@ from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
+    mxfp_paged_cache_views,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -104,6 +105,7 @@ from vllm_ascend.utils import (
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
     get_kv_cache_tensor_layers,
+    is_c8_mixed_kv_overlay_enabled,
     is_c8_mxfp_kv_quant,
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_packed_sfa_main_cache,
@@ -1005,6 +1007,25 @@ def can_overlay_attention_kv_groups(
             specs.append(group_spec)
     if not specs or any(type(spec) not in (FullAttentionSpec, SlidingWindowSpec) for spec in specs):
         return False
+    if is_c8_mixed_kv_overlay_enabled(vllm_config):
+        # C8 mixed-page overlay: pages may differ ACROSS groups (the C8 group
+        # keeps its 264 B/token quantized page, the sliding groups their true
+        # bf16 page) as long as each group is internally uniform; the C8 dtype
+        # is materialized by the packet-view builder instead of the K/V split.
+        # The block-outer descriptors this mode produces are consumed by the
+        # ``block_stride``-aware branch in ``_allocate_kv_cache``.
+        for group in kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            group_specs = (
+                list(group_spec.kv_cache_specs.values())
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else [group_spec]
+            )
+            if len({spec.page_size_bytes for spec in group_specs}) != 1:
+                return False
+            if any(spec.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn) for spec in group_specs):
+                return False
+        return True
     if len({spec.page_size_bytes for spec in specs}) != 1:
         # Different page sizes need the upstream padding machinery; keep them
         # on the per-layer allocation path.
@@ -1222,6 +1243,7 @@ def _allocate_kv_cache(
 
     layerwise_reuse = get_layerwise_reuse_config(vllm_config.kv_transfer_config) is not None
     layerwise_aliases: dict[str, str] = {}
+    c8_overlay_mode = is_c8_mixed_kv_overlay_enabled(vllm_config)
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         shared_names = get_kv_cache_tensor_layers(kv_cache_tensor)
         if not shared_names:
@@ -1302,6 +1324,35 @@ def _allocate_kv_cache(
             continue
 
         if hybrid_backing is not None:
+            example_page = layer_kv_cache_spec[shared_names[0]].page_size_bytes
+            if c8_overlay_mode and kv_cache_tensor.layer_stride == example_page:
+                # C8 mixed-page overlay: block-outer descriptors. Layer i of
+                # block b lives at offset + i*page + b*block_stride and every
+                # descriptor aliases the whole pool (a block ID belongs to one
+                # group at a time). Hand each layer a 1-D slice from its
+                # in-slot offset; _reshape_kv_cache_v2 splits K/V (bf16) or
+                # builds packet views (C8) with block_stride as the page pitch.
+                if kv_cache_tensor.block_stride < example_page:
+                    raise ValueError(
+                        "C8 mixed-page overlay KV cache requires a block stride "
+                        f"of at least one page, but {shared_names[0]} has "
+                        f"block_stride={kv_cache_tensor.block_stride}, "
+                        f"page_size={example_page}."
+                    )
+                for layer_idx, layer_name in enumerate(shared_names):
+                    start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
+                    extent = (
+                        start
+                        + (kv_cache_config.num_blocks - 1) * kv_cache_tensor.block_stride
+                        + example_page
+                    )
+                    if extent > hybrid_backing.numel():
+                        raise ValueError(
+                            f"C8 mixed-page overlay KV cache view for {layer_name} "
+                            "exceeds the backing allocation."
+                        )
+                    kv_cache_raw_tensors[layer_name] = hybrid_backing[start:]
+                continue
             for layer_idx, layer_name in enumerate(shared_names):
                 layer_spec = layer_kv_cache_spec[layer_name]
                 layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
@@ -1599,6 +1650,15 @@ def _reshape_kv_cache_v2(
         if is_dsv4_model and uses_turboquant_groups(kv_cache_config.kv_cache_groups)
         else {}
     )
+    c8_overlay_block_strides: dict[str, int] = (
+        {
+            name: descriptor.block_stride
+            for descriptor in kv_cache_config.kv_cache_tensors
+            for name in get_kv_cache_tensor_layers(descriptor)
+        }
+        if is_c8_mixed_kv_overlay_enabled(vllm_config)
+        else {}
+    )
 
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -1627,7 +1687,27 @@ def _reshape_kv_cache_v2(
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
-                kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                pitch = c8_overlay_block_strides.get(layer_name)
+                if pitch is not None:
+                    # Shared block-outer backing: the raw slice runs from this
+                    # layer's in-slot offset to the end of the pool, so the
+                    # kernel-block count comes from the config, not from
+                    # numel, and the physical pitch is the block stride.
+                    if kv_cache_spec.block_size % kernel_block_size:
+                        raise ValueError(
+                            "MXFP scheduler block must contain a whole number of kernel blocks."
+                        )
+                    kv_caches[layer_name] = mxfp_paged_cache_views(
+                        raw_cache,
+                        kv_cache_config.num_blocks * (kv_cache_spec.block_size // kernel_block_size),
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        kv_cache_spec.head_size_v,
+                        kernel_block_size,
+                        page_stride_bytes=pitch,
+                    )
+                else:
+                    kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
                 continue
 
             if layer_name in layer_tuple_strides:
@@ -1856,10 +1936,17 @@ def _reshape_kv_cache_v2(
             if not isinstance(kv_cache_spec, AttentionSpec):
                 raise TypeError(f"Unsupported KV cache spec: {type(kv_cache_spec).__name__}.")
 
+            overlay_pitch = c8_overlay_block_strides.get(layer_name)
             if isinstance(raw_cache, tuple):
                 raw_k_tensor, raw_v_tensor = raw_cache
                 total_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                 page_stride_bytes = kv_cache_spec.page_size_bytes
+            elif overlay_pitch is not None:
+                # Shared block-outer backing: the raw slice runs from this
+                # layer's in-slot offset to the end of the pool, so derive the
+                # geometry from the config instead of the slice length.
+                total_bytes = raw_cache.numel()
+                page_stride_bytes = overlay_pitch
             else:
                 # Attention and Mamba use independent logical views over one
                 # physical padded-page geometry.
@@ -1870,9 +1957,12 @@ def _reshape_kv_cache_v2(
                     else kv_cache_spec.page_size_bytes
                 )
 
-            if total_bytes % page_stride_bytes:
-                raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
-            num_blocks = total_bytes // page_stride_bytes
+            if overlay_pitch is not None:
+                num_blocks = kv_cache_config.num_blocks
+            else:
+                if total_bytes % page_stride_bytes:
+                    raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
+                num_blocks = total_bytes // page_stride_bytes
             num_blocks_per_kv_block = get_storage_block_size(kv_cache_spec) // kernel_block_size
             kernel_num_blocks = num_blocks * num_blocks_per_kv_block
             kv_cache_shape = group.backend.get_kv_cache_shape(

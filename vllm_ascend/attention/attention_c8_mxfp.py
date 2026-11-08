@@ -211,8 +211,16 @@ def mxfp_paged_cache_views(
     k_bytes, ks_bytes, v_bytes, vs_bytes = mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim)
     payload_bytes = k_bytes + ks_bytes + v_bytes + vs_bytes
     pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
-    if pitch < payload_bytes or raw_tensor.numel() < num_kernel_blocks * pitch:
-        raise ValueError("MXFP raw cache or physical page pitch is smaller than the payload.")
+    if pitch < payload_bytes:
+        raise ValueError("MXFP physical page pitch is smaller than the payload.")
+    # Addressability is a property of the underlying storage: raw_tensor may be
+    # a slice of a shared block-outer backing whose remaining extent (from this
+    # layer's storage offset to the end) is intentionally smaller than
+    # num_kernel_blocks * pitch, because later layers' slots overlay the same
+    # address range for other groups.
+    extent = raw_tensor.storage_offset() + (num_kernel_blocks - 1) * pitch + payload_bytes
+    if raw_tensor.untyped_storage().nbytes() < extent:
+        raise ValueError("MXFP raw cache or physical page pitch exceeds storage.")
     shapes = (
         (num_kernel_blocks, num_kv_heads, k_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
         (num_kernel_blocks, num_kv_heads, v_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
