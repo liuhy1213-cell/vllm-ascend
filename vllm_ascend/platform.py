@@ -56,6 +56,7 @@ from vllm_ascend.utils import (
     refresh_block_size,
     update_cudagraph_capture_sizes,
     enable_sp,
+    is_c8_mixed_kv_overlay_enabled,
 )
 
 if TYPE_CHECKING:
@@ -540,6 +541,27 @@ class NPUPlatform(Platform):
 
         # 10.Set pytorch NPU allocator env (vllm_config)
         _set_pytorch_npu_alloc_env(vllm_config)
+
+    @classmethod
+    def _align_heterogeneous_kv_block_size(cls, vllm_config: VllmConfig, backend_cls: Any) -> None:
+        """Skip the upstream uniform-page lift under the C8 mixed-page overlay.
+
+        The upstream alignment bumps the primary block size (512 -> 1024) and
+        records a shared padded page in ``skip_page_size_padded`` so every
+        skip-quant layer pads up to the quantized page. That contract exists
+        for the uniform-page pool; the C8 mixed-page overlay consumes TRUE
+        per-group pages in a block-outer shared pool instead, and the padded
+        shared page would re-materialize the 4x sliding-layer waste the
+        overlay exists to remove.
+        """
+        if is_c8_mixed_kv_overlay_enabled(vllm_config):
+            logger.info_once(
+                "C8 mixed-page KV overlay: keeping block size %d and true "
+                "per-group pages (skipping the heterogeneous block-size lift).",
+                vllm_config.cache_config.block_size,
+            )
+            return
+        super()._align_heterogeneous_kv_block_size(vllm_config, backend_cls)
 
     @classmethod
     def set_additional_forward_context(

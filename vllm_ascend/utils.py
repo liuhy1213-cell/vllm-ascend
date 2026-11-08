@@ -1479,6 +1479,25 @@ def is_minimax_m3_fp8_kv_cache(vllm_config: VllmConfig | None) -> bool:
     )
 
 
+def is_c8_mixed_kv_overlay_enabled(vllm_config: VllmConfig | None) -> bool:
+    """True when the S2 path-A mixed-page KV overlay should engage.
+
+    Signature-gated and opt-in: requires the C8-MXFP KV cache dtype WITH
+    skip layers (so bf16 sliding-window groups coexist with the quantized
+    full-attention group) AND the VLLM_ASCEND_ENABLE_C8_MIXED_OVERLAY env.
+    Every consumer of this flag keeps the upstream uniform-page behavior
+    when it returns False, so production deployments are unaffected.
+    """
+    from vllm_ascend.envs import VLLM_ASCEND_ENABLE_C8_MIXED_OVERLAY
+
+    if not VLLM_ASCEND_ENABLE_C8_MIXED_OVERLAY:
+        return False
+    if not is_c8_mxfp_kv_quant(vllm_config):
+        return False
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return bool(getattr(cache_config, "kv_cache_dtype_skip_layers", None))
+
+
 def refresh_block_size(vllm_config):
     """
     Refresh the block size in cache config.

@@ -4,11 +4,16 @@ import math
 from collections import defaultdict
 from dataclasses import replace
 
+import torch
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
+from vllm.v1.core.kv_cache_utils import (
+    _approximate_gcd,
+    _get_per_layer_spec,
+    may_override_num_blocks,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -19,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -587,13 +593,144 @@ def _ascend_max_memory_usage_bytes_from_groups(
     )
 
 
+def _c8_mixed_overlay_true_page_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> bool:
+    """Recognize the C8 mixed-page overlay spec set (true per-group pages).
+
+    The platform skip-align hook kept ``skip_page_size_padded`` unset, so the
+    sliding specs carry their true bf16 pages while the C8 specs carry the
+    264 B/token quantized page. ``unify_kv_cache_spec_page_size`` would pad
+    the smaller page back up to the max (recovering the waste this mode
+    removes), so the caller must group these specs WITHOUT unification.
+    """
+    from vllm_ascend.utils import is_c8_mixed_kv_overlay_enabled
+
+    if not kv_cache_spec or len({s.page_size_bytes for s in kv_cache_spec.values()}) <= 1:
+        return False
+    has_c8 = any(
+        type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
+        for spec in kv_cache_spec.values()
+    )
+    if not has_c8:
+        return False
+    if not all(type(spec) in (FullAttentionSpec, SlidingWindowSpec) for spec in kv_cache_spec.values()):
+        return False
+    if any(getattr(spec, "page_size_padded", None) is not None for spec in kv_cache_spec.values()):
+        # A padded spec means the uniform-page lift still ran; keep the
+        # upstream path rather than mixing geometries.
+        return False
+    return is_c8_mixed_kv_overlay_enabled(vllm_config)
+
+
 def _get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
+    if _c8_mixed_overlay_true_page_specs(vllm_config, kv_cache_spec):
+        # True per-group pages: group by spec type and split by the repeat
+        # pattern (25 full C8 layers -> one group; 63 sliding layers -> three
+        # 21-layer groups), skipping ``unify_kv_cache_spec_page_size`` which
+        # pads the smaller page back to the max.
+        groups = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+        vllm.v1.core.kv_cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+        vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(vllm_config, groups)
+        group_pages = [
+            sorted({spec.page_size_bytes for spec in group.kv_cache_spec.kv_cache_specs.values()})
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else [group.kv_cache_spec.page_size_bytes]
+            for group in groups
+        ]
+        logger.info(
+            "C8 mixed-page KV overlay: grouped %d layers into %d groups with "
+            "true per-group pages %s",
+            len(kv_cache_spec),
+            len(groups),
+            group_pages,
+        )
+        return groups
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
+def _get_c8_mixed_overlay_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """Build block-outer descriptors over one shared pool of true pages.
+
+    Every group aliases the whole backing from byte 0: layer ``i`` of block
+    ``b`` lives at ``i * page_g + b * bytes_per_block`` with
+    ``bytes_per_block = max(group sum of true pages)``. A block ID belongs to
+    one group at a time, so groups may reuse the same physical slots. The
+    largest group pins ``bytes_per_block``; with the C8-mixed layer split
+    that is the bf16 sliding group (21 x 262,144 = 5,505,024 per 512-token
+    block), and ``num_blocks = available_memory // bytes_per_block`` is the
+    token-normalized budget the design doc requires (no per-layer scaling).
+    """
+    if not vllm_config.use_v2_model_runner:
+        raise ValueError(
+            "The C8 mixed-page KV overlay requires the V2 model runner "
+            "(set VLLM_USE_V2_MODEL_RUNNER=1)."
+        )
+    group_pages: list[int] = []
+    for group in kv_cache_groups:
+        specs = (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+        pages = {spec.page_size_bytes for spec in specs}
+        if len(pages) != 1:
+            raise ValueError(
+                "C8 mixed-page overlay groups must carry one page size per group, "
+                f"got {sorted(pages)}."
+            )
+        group_pages.append(len(group.layer_names) * pages.pop())
+    bytes_per_block = max(group_pages)
+    num_blocks = may_override_num_blocks(vllm_config, available_memory // bytes_per_block)
+    if num_blocks <= 0:
+        raise ValueError(
+            f"C8 mixed-page overlay needs a positive block count, got {num_blocks} "
+            f"from {available_memory} bytes // {bytes_per_block}."
+        )
+    size = bytes_per_block * num_blocks
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        page = (
+            next(iter(spec.kv_cache_specs.values())).page_size_bytes
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else spec.page_size_bytes
+        )
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=size,
+                layers=list(group.layer_names),
+                offset=0,
+                layer_stride=page,
+                block_stride=bytes_per_block,
+            )
+        )
+    logger.info(
+        "C8 mixed-page KV overlay: bytes_per_block=%d over %d groups, "
+        "num_blocks=%d, pool=%d MiB, %d B/token per block slot",
+        bytes_per_block,
+        len(kv_cache_groups),
+        num_blocks,
+        size >> 20,
+        bytes_per_block
+        // _get_per_layer_spec(kv_cache_groups[0], kv_cache_groups[0].layer_names[0]).block_size,
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
+    )
 
 
 def _ascend_get_kv_cache_config_from_groups(
@@ -611,10 +748,19 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
+    from vllm_ascend.utils import is_c8_mixed_kv_overlay_enabled
+
     if is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
+    elif any(
+        type(_get_per_layer_spec(group, group.layer_names[0])) is FullAttentionSpec
+        and _get_per_layer_spec(group, group.layer_names[0]).dtype == torch.float8_e4m3fn
+        for group in kv_cache_groups
+        if group.layer_names
+    ) and is_c8_mixed_kv_overlay_enabled(vllm_config):
+        kv_cache_config = _get_c8_mixed_overlay_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif not _is_deepseek_v4_groups(kv_cache_groups):
         kv_cache_config = _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
     else:
