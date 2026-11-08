@@ -865,7 +865,17 @@ rate 2.2 能到 2.12 req/s / 8,623，但 TTFT p99 4.72 s 已破线 ⇒ **可运�
     `docker exec ... vllm bench` 的子进程会继续跑。两个 bench 重叠时，proxy 的到达速率是两者之和
     （实测 1.87 req/s ≫ 名义 2.0 的一半），TTFT/吞吐全部失真，且结果文件会互相覆盖。
     正确做法：`docker exec <ctn> pkill -9 -f "[v]llm bench"`，并确认 `ps` 里 bench 进程为 0 再开下一轮。
-15. **正确性闸门不能用 greedy 文本相等**：不同引擎/内核在近并列位置会翻转
+15. **单次超长压测跑不起来是客户端在生成 prompt**：`vllm bench serve --dataset-name random`
+    会先把全部 prompt 物化（64k token × N 条）。1200 条 ≈ 7,700 万 token 尚可（每轮 ~1–3 分钟），
+    12,600 条 ≈ 8 亿 token 时客户端会卡在生成阶段、请求量为 0（实测 4 分钟无一个请求到达）。
+    ⇒ **长时间长稳要分段**（每段 1200 条），代价是段间有几分钟生成空档——所以"2 h 带压"实际
+    需要 ~2.5–3 h 墙钟。
+16. **`docker exec` 内 `pkill` 可能静默失败**：两个会话各自踩到——(a) 压测客户端在
+    "生成 prompt"阶段时 `pkill -9 -f "[v]llm bench"` 不生效（本次实测两条 bench 重叠，
+    必须按 PID 杀并复查进程数为 1）；(b) 清引擎时容器内 pkill 后 9 个孤儿进程仍活着占满
+    93.7 GB（友军会话实测）。⇒ 清引擎一律**宿主机侧** `pkill -9 -f '[V]LLM::'` +
+    `npu-smi` 核对空闲卡数回到基线，再拉新引擎。
+17. **正确性闸门不能用 greedy 文本相等**：不同引擎/内核在近并列位置会翻转
     （`<think>` 之后两个开头 logprob 差 0.02–0.03）；用"P 的 top-1 token 落在 D 的 top-5
     且 |Δlogprob| ≤ 0.1 nat"判据（`correctness_gate.sh`）。KV 错位时 Δ 会是 2–3 nat。
 16. **pkill（SIGTERM）后 NPU 显存释放要 >60s**：A 机 V2 崩溃后 2 分钟内重启 V1，
