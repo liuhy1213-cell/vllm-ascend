@@ -1077,3 +1077,77 @@ page_size_padded 的 spec → False）；**真实 IQuest 层模式**（4 full + 
 MTP = 26f/63s）喂真实 `_get_kv_cache_groups_uniform_page_size` → **[26,21,21,21]、
 真页 [135,168, 262,144×3]** → bpb=5,505,024=10,752 B/token。整链（spec→门→分组→
 descriptor→分配→视图→清零→connector）全部经真实代码或 66 项几何单测覆盖。
+
+### 8.4 Patch 5（block lift）+ Patch 6（门控归一 + extent 护栏）+ Patch 7（connector P0-1）（2026-11-08 18:xx）
+
+**真机容量证据与核心公式**（node6 s2-c8 e/ 日志，激活链全绿）：core 公式
+（kv_cache_utils.py:1067）`conc = NB / Σ_g cdiv(spec.max_memory_usage_bytes, page)`；
+实测 13,307 / (256+3×161) = 18.01x 全对上，A 机 bf16 基线 27,454/1,507 = 18.215x 对上。
+**发现 Patch 1-4 的实现缺陷**：overlay 跳过上游 `_align_heterogeneous_kv_block_size`
+时把 block lift 也跳掉了——sliding spec 保留 native block 128（页 65,536），
+每请求 sliding 页 161/组吃光 C8 收益 ⇒ 真机 ≈0.99× 无增益。§G 设计值
+（sliding 页 262,144、bpb 5,505,024）与单测 fixture 本来就对。
+
+- **Patch 5 = overlay 路径内做 block lift**（`_c8_mixed_overlay_lift_block_sizes`，
+  math.lcm 原地 mutate，`replace(spec, block_size=…)` 依赖 page_size_bytes 为派生
+  property 自动重算页，不 padding）：lift 后 bpb 5,505,024（21×262,144 钉住）、
+  Σ = 256+3×41 = 379、conc ≈ 22.42 = **×1.238 兑现设计值**。窗口护栏：LCM > min
+  (sliding_window) 时整体跳过（容量收益让位于读路径）。native 128 的机制（peer 实锤）：
+  `get_supported_kernel_block_sizes` 的 C8 分支依赖 `get_current_vllm_config_or_none()`，
+  spec 构建期为 None → 返回 [128]，且 9 进程各自建 spec、platform 钩子只在 TP0 跑 ⇒
+  per-process latch 不可靠，lift 必须在 overlay 路径内做。
+- **Patch 6 = 17 代码审查 P0-2/P1 的修复**：① 分组门 `_c8_mixed_overlay_true_page_specs`
+  补 layout-compact 检查（对齐 worker 侧 `can_overlay_attention_kv_groups`）；
+  ② config 分派侧原宽松条件（任意 fp8 full 组 + env）替换为
+  `_c8_mixed_overlay_groups_eligible` —— 与分组门同条件（页多样性/全 Full-Sliding/
+  无 padding/dtype 封套/layout compact/env），分组回退时 config 不再产出 overlay
+  描述符；③ reshape 的 block-outer 分支加 extent 护栏：raw slice 必须 host 得下
+  (NB−1)×pitch+page，分配器万一回退私有 buffer 时响亮报错而非越界写。
+- **Patch 7 = 17 审查 P0-1 的修复（connector）**：`batch_transfer_sync_read(session,
+  local, peer, len)` 语义 = 从 peer 读入 local ⇒ 变量名反直觉（`src_*=本地目的地`、
+  `dst_*=peer 数据源`），旧代码对 **peer 缓冲用了本地 stride**——P/D full 组层数不等
+  （P 25 无 draft / D 26 带 draft，08:44 日志）时 peer 源地址整体错位。修复：
+  `MooncakeAgentMetadata` 增 `block_strides` + `group_layer_counts` 交换；peer 侧寻址
+  用远端 stride（老 peer 缺字段 → 回退本地 stride + 一次性警告）；stride 不等时按块
+  拆分（每块各自用各侧 stride，run 连续性只在对称时保留）；组数不齐时迭代共享前缀
+  （多出的本地组跳过——draft 组 KV 本就 D 本地生成）；逐组层数对账，错位响亮报错；
+  启动日志加 block_strides 集合对账。**已知未修（性能非正确性）**：overlay 逐层寻址
+  下 run 长度含 tile 行内其他层的页 ⇒ 传输量 ×L（L=组内层数，最多 26）——D3 落地、
+  PD overlay 成为生产形态后按组合并传输另立 patch。
+- **新 UT**：`tests/ut/core/test_c8_mixed_overlay_lift.py`（17 审查 P2-①：生产函数
+  直接进 UT，13 用例——lift 原地/护栏/noop、两道门的混合页/均匀页/padding/layout/
+  env-off；fixture 快照并复原模块级 vllm 钩子）。tools 镜像脚本保持为设计稿对账
+  harness（P2-② 部分保留，生产路径已由本 UT 覆盖）。
+- **§L 修正**：e/ 日志已被 peer 09:17 启动器截断（同 SFS 路径 `exec > $LOG_FILE`），
+  精确 avail 字节数不可恢复；AVAIL 锚改为 NB 下界 13,307×3,514,368 = 43.5495 GiB
+  （与日志舍入值 43.55 GiB 自洽 <0.005 GiB）。教训：**每个引擎的 LOG_ROOT 必须独立**
+  （43.87 用 logs-s2a87，node6 建议 logs-n6）。
+- **D3（draft bf16 SlidingWindowSpec(512) 独立组）集成约束（给 peer）**：
+  ① draft 组**必须排在组列表最后**（模型层序里 draft 最晚），否则组下标错位——
+  connector 现在会响亮报错（逐组层数对账）而非静默串组；draft-last 时多出的本地组
+  被跳过，draft KV 本地生成无需传输 ✓。② draft spec native block 也是 128，会被
+  同一 lift 覆盖到 512；窗口护栏 min(windows)=512 时 512>512 为 False，放行 ✓。
+  ③ draft 进独立组后 P/D full 组都是 25 层 ⇒ stride 对称，run 快路径成立，P0-1
+  场景消失（Patch 7 是纵深防御）。
+- **验证**：py_compile 全过；A 机容器（iquest-sla-a）真实 spec 冒烟
+  （S0-S8：native 128→512 lift、页 65,536→262,144 派生重算、full 页不变、护栏
+  skip、uniform noop、真实分组 util 组页集合 {131,072, 262,144} 全覆盖）+ §A-§L
+  镜像单测全绿。上机 A/B（env OFF vs ON block 512 的 core tokens 对）与精度三件套
+  待 peer/精度侧在修复后引擎上执行。
+- **Rebase 收尾（2026-11-08 11:3x）**：`temp/s2-patch5-block-lift` 已重放到 s2a
+  tip `0a6f9e2fb` 之上（peer 的 draft spec / equality buckets + within-run split
+  三提交 + 我的 §8.3 `cb8efacf6` + Patch 5 `dc48e9d5d` + Patch 6 `9cd605a50` +
+  Patch 7 `f268b2588` + 本节 `c08266cac`）。冲突唯一出现在 Patch 5 调用点：
+  保留 peer 的 `_get_c8_mixed_overlay_groups` 分桶调用，lift 插在其前
+  （lift → 分桶 → annotate）。**集成语义验证**：spec dataclass 按**值**哈希
+  （iquest-s2a-87 实测 eq/hash），lift 的 `replace()` 新实例与 peer 分桶的
+  值相等键完全兼容——63 个滑窗层 post-lift 仍并成一桶再 k%3 切 3×21。
+  集成冒烟（43.87 容器 iquest-s2a-87）：pytest 13 passed + S10-S13 全绿——
+  D3 五组几何 [25 full, 21, 21, 21, 1 draft]、sliding 页 262,144、组 bpb
+  集合 {25×131,072 full, 5,505,024 sliding, 262,144 draft} 精确命中。
+- **崩溃机制闭环（peer 43.87 实测确认）**：pre-Patch5 引擎**不可能过
+  bring-up**——分组后 core.py:345 把 cache_config.block_size 钉到
+  min(各组 block)=128，握手退出时 `__post_init__` 重跑 refresh_block_size
+  raise（128%512≠0 且 user_specified）。Patch 5 同时消掉 128 页与该 raise。
+- **peer 43.87 post-fix 预测锚点**：D3 五组 post-lift bpb=5,505,024（sliding
+  钉住，与设计锚点一致），44,596 MiB 池 NB≈8,494（设计 8,496）；待引擎实测对数。
