@@ -15,6 +15,7 @@ class IQuestQ1Config(PretrainedConfig):
         vocab_size: int = 160000,
         hidden_size: int = 3072,
         intermediate_size: int = 1536,
+        moe_intermediate_size: int | None = None,
         dense_intermediate_size: int = 12288,
         num_hidden_layers: int = 88,
         num_attention_heads: int = 48,
@@ -57,6 +58,13 @@ class IQuestQ1Config(PretrainedConfig):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        # The MoE experts reuse `intermediate_size`; expose it under the
+        # attribute name expected by the Ascend A5 MegaMoe capability check.
+        self.moe_intermediate_size = (
+            intermediate_size
+            if moe_intermediate_size is None
+            else moe_intermediate_size
+        )
         self.dense_intermediate_size = dense_intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
