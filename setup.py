@@ -510,6 +510,10 @@ setup(
             "ascend_model_loader = vllm_ascend:register_model_loader",
             "ascend_service_profiling = vllm_ascend:register_service_profiling",
             "ascend_model = vllm_ascend:register_model",
+            "ascend_router_load = vllm_ascend.observability.router_load:install_engine_method",
+        ],
+        "vllm.endpoint_plugins": [
+            "ascend_router_load = vllm_ascend.observability.router_load_api:RouterLoadEndpoint",
         ],
         "ms_service_metric.providers": [
             "vllm-ascend = vllm_ascend.observability:get_metric_provider",
