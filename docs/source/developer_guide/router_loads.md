@@ -12,20 +12,26 @@ The implementation requires vLLM's endpoint-plugin API and V1 utility API,
 validated with vLLM 0.30.0. Older releases without endpoint plugins need a
 separate adapter.
 
-Add `ascend_router_load` to the existing `VLLM_PLUGINS` allowlist. Keep all
-plugins required by the model, connector and platform. Example for this repo:
+The endpoint is enabled by default when the Ascend platform is loaded. No
+`VLLM_PLUGINS` setting or new startup flag is required; existing allowlists
+remain unchanged, including an empty list. This only enables the load API,
+not any other optional endpoint plugin.
 
 ```bash
-export VLLM_PLUGINS=ascend_kv_connector,ascend_model_loader,ascend_service_profiling,ascend_model,ascend_router_load
 # Start vllm serve with the existing model/TP/DP/connector configuration.
 curl -fsS 'http://127.0.0.1:8000/v1/loads?include=core,disagg,router_load'
 ```
 
 Use the existing Engine API authentication headers if required. No new HTTP
-listener is opened. The plugin is registered in two groups: `general_plugins`
-installs the EngineCore method, and `endpoint_plugins` attaches HTTP routes.
-The endpoint is opt-in through vLLM's existing plugin mechanism. Missing
-Engine methods or failed ranks return 503, never a fabricated idle snapshot.
+listener is opened. Ascend platform registration installs two idempotent hooks:
+the native general-plugin initialization also installs the EngineCore method,
+and the native endpoint loader includes the load endpoint for generation tasks.
+Both hooks retain the original loaders and their filtering of other plugins;
+no environment variables are rewritten. EngineCore imports are deferred until
+engine initialization to avoid platform-discovery circular imports. The API
+uses the native endpoint attach/state lifecycle. Pooling-only servers do not
+receive these routes. Missing Engine methods or failed ranks return 503, never
+a fabricated idle snapshot.
 Invalid `include` returns 400. Responses use `Cache-Control: no-store`.
 
 ## Accounting

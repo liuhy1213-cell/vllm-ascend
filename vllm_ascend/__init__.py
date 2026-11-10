@@ -72,6 +72,9 @@ def _ensure_global_patch():
 def register():
     """Register the NPU platform."""
 
+    from vllm_ascend.observability.router_load_defaults import install_default_load_hooks
+
+    install_default_load_hooks()
     return "vllm_ascend.platform.NPUPlatform"
 
 

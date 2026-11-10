@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Opt-in vLLM endpoint plugin. Router polls; Engine does not push metrics."""
+"""Default Ascend load endpoint. Router polls; Engine does not push metrics."""
 
 import asyncio
 

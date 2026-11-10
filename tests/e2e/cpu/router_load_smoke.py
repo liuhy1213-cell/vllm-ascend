@@ -19,10 +19,11 @@ from unittest.mock import AsyncMock
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from vllm.plugins.endpoint_plugins.interface import attach_endpoint_plugins, init_endpoint_plugins_state
 
 from tests.ut.observability.test_router_load import make_engine, req
+from vllm_ascend import register
 from vllm_ascend.observability.router_load import collect_load
-from vllm_ascend.observability.router_load_api import RouterLoadEndpoint
 
 
 def listener():
@@ -49,10 +50,10 @@ async def main():
         return collect_load(engine0 if engine == b"zero" else engine1)
 
     app = FastAPI()
-    plugin = RouterLoadEndpoint()
-    plugin.attach_router(app)
+    register()
+    attach_endpoint_plugins(app, ("generate",))
     core = NS(core_engines=[b"zero", b"one"], _call_utility_async=AsyncMock(side_effect=query))
-    await plugin.init_state(NS(engine_core=core), app.state, None)
+    await init_endpoint_plugins_state(NS(engine_core=core), app.state, None)
     app.add_api_route("/health", lambda: {})
     app.add_api_route("/v1/models", lambda: {"data": [{"id": "load-test"}]})
     sock = listener()

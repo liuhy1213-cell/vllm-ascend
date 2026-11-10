@@ -309,3 +309,64 @@ def test_native_hybrid_swa_and_mtp_prefix_boundaries(mtp):
     native_hit = manager.get_computed_blocks(query)[1]
     assert native_hit > 0
     assert load["p_pending_uncached_tok"] == 129 - native_hit
+
+
+@pytest.mark.parametrize("allowlist", [None, "", "other_plugin", "ascend_router_load,other_plugin"])
+def test_default_registration_without_plugin_configuration(monkeypatch, allowlist):
+    import importlib.metadata
+    import os
+
+    import vllm.plugins as plugins
+    from vllm.plugins.endpoint_plugins.interface import attach_endpoint_plugins, init_endpoint_plugins_state
+    from vllm.v1.engine.core import EngineCore
+
+    from vllm_ascend import register
+
+    if allowlist is None:
+        monkeypatch.delenv("VLLM_PLUGINS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PLUGINS", allowlist)
+    # Restore global loader functions and native once flag after each scenario.
+    monkeypatch.setattr(plugins, "load_general_plugins", plugins.load_general_plugins)
+    monkeypatch.setattr(plugins, "load_endpoint_plugins", plugins.load_endpoint_plugins)
+    monkeypatch.setattr(plugins, "plugins_loaded", False)
+    monkeypatch.delattr(EngineCore, "get_router_load_snapshot", raising=False)
+    other_general = Mock()
+    other_endpoint = NS(name="other_plugin", required_tasks=("generate",))
+
+    def entry_points(*, group):
+        factory = (lambda: other_endpoint) if group == plugins.ENDPOINT_PLUGINS_GROUP else other_general
+        return [NS(name="other_plugin", value="test:other_plugin", load=lambda: factory)]
+
+    monkeypatch.setattr(importlib.metadata, "entry_points", entry_points)
+    assert register() == "vllm_ascend.platform.NPUPlatform"
+    general, endpoint_loader = plugins.load_general_plugins, plugins.load_endpoint_plugins
+    register()
+    assert plugins.load_general_plugins is general
+    assert plugins.load_endpoint_plugins is endpoint_loader
+    plugins.load_general_plugins()
+    plugins.load_general_plugins()
+    assert EngineCore.get_router_load_snapshot is collect_load
+    assert other_general.call_count == (1 if allowlist is None or "other_plugin" in allowlist else 0)
+    endpoints = plugins.load_endpoint_plugins(("generate",))
+    assert sum(p.name == "ascend_router_load" for p in endpoints) == 1
+    assert (other_endpoint in endpoints) == (allowlist is not None and "other_plugin" in allowlist)
+    assert not any(p.name == "ascend_router_load" for p in plugins.load_endpoint_plugins(("embed",)))
+    assert not any(p.name == "ascend_router_load" for p in plugins.load_endpoint_plugins(None))
+    assert os.environ.get("VLLM_PLUGINS") == allowlist
+
+    # Exercise the native API attach/state lifecycle, without manual plugin setup.
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda **kwargs: [])
+    app = FastAPI()
+    attach_endpoint_plugins(app, ("generate",))
+    core = NS(call_utility_async=AsyncMock(return_value=collect_load(make_engine())))
+
+    async def check():
+        await init_endpoint_plugins_state(NS(engine_core=core), app.state, None)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            for path in ("/v1/loads", "/v1/load"):
+                response = await client.get(path)
+                assert response.status_code == 200
+                assert response.json()["loads"][0]["router_load"]["waiting_reqs"] == 0
+
+    asyncio.run(check())
