@@ -577,11 +577,13 @@ class NPUPlatform(Platform):
         from vllm_ascend.ascend_forward_context import (
             _is_decode_only_node,
             get_mc2_mask,
+            get_mrv2_draft_forward,
             get_mrv2_in_profile_run,
             select_moe_comm_method,
             use_cann_megamoe,
         )
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+        from vllm_ascend.quantization.quant_type import QuantType
         from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
         from vllm.distributed import get_dp_group, get_tensor_model_parallel_world_size
 
@@ -603,8 +605,21 @@ class NPUPlatform(Platform):
         if not vllm_config.use_v2_model_runner:
             return {"dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg}
 
-        # is_draft_model will be removed later, so we set it to False temporarily.
-        is_draft_model = False
+        # MRv2 builds the base forward context upstream, so this hook cannot tell
+        # from vllm_config alone whether the current forward belongs to the draft
+        # model: _run_model passes the target vllm_config. The speculator marks its
+        # draft forward/capture paths through this ContextVar. V1 resolves the same
+        # is_draft_model/draft_moe_quant_type pair in set_ascend_forward_context.
+        is_draft_model = get_mrv2_draft_forward()
+        if is_draft_model:
+            draft_model_config = getattr(
+                getattr(vllm_config, "speculative_config", None),
+                "draft_model_config",
+                None,
+            )
+            draft_moe_quant_type = getattr(draft_model_config, "draft_moe_quant_type", QuantType.NONE)
+        else:
+            draft_moe_quant_type = QuantType.NONE
         # v2 has 2 graphs in eager, one for prefill, the other for decodes, this flag is aimed to distinguish them.
         is_draft_model_prefill = False
         sinks = False
@@ -637,6 +652,8 @@ class NPUPlatform(Platform):
         moe_comm_type = select_moe_comm_method(
             max_tokens_across_dp,
             vllm_config,
+            is_draft_model=is_draft_model,
+            draft_moe_quant_type=draft_moe_quant_type,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 
@@ -665,6 +682,7 @@ class NPUPlatform(Platform):
             "mc2_mask": mc2_mask,
             "is_draft_model": is_draft_model,
             "is_draft_model_prefill": is_draft_model_prefill,
+            "draft_moe_quant_type": draft_moe_quant_type,
             "in_profile_run": in_profile_run,
             "padded_num_tokens": padded_num_tokens,
             "sinks": sinks,

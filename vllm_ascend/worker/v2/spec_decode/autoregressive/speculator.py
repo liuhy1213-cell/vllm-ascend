@@ -39,6 +39,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegress
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import override_mrv2_draft_forward
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.attention_cp import build_dcp_fia_params
 from vllm_ascend.attention.context_parallel.common_cp import CPKVScope
@@ -408,6 +409,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         if self.prefill_cudagraph_manager.use_breakable_cg:
             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
         with (
+            override_mrv2_draft_forward(True),
             disable_target_pcp_for_replicated_draft(self),
             build_attn_metadata_wrapper(),
         ):
@@ -430,6 +432,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         # Capture all decode draft generation steps as a single graph.
         assert self.decode_cudagraph_manager is not None
         with (
+            override_mrv2_draft_forward(True),
             disable_target_pcp_for_replicated_draft(self),
             build_attn_metadata_wrapper(),
         ):
@@ -454,14 +457,18 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Override AutoRegressiveSpeculator._run_model for Ascend NPUs."""
-        last_hidden_states, hidden_states = super()._run_model(
-            num_tokens,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-            mm_inputs,
-        )
+        # Upstream builds the forward context with the target vllm_config even
+        # for draft forwards, so mark this path as a draft forward for the
+        # Ascend platform hook (A5 MoE comm-method selection needs it).
+        with override_mrv2_draft_forward(True):
+            last_hidden_states, hidden_states = super()._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                mm_inputs,
+            )
         return AscendPCPManager.broadcast_replicated_hidden_states(
             last_hidden_states, hidden_states, num_tokens, replicated_pcp=self.replicated_pcp
         )
