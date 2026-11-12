@@ -927,6 +927,54 @@ class TestRefreshBlockSizeC8MXFP(TestBase):
             utils.refresh_block_size(config)
 
 
+class TestUsesKvPoolConnector(TestBase):
+    @staticmethod
+    def _multi(*connectors):
+        return SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_extra_config={"connectors": list(connectors)},
+        )
+
+    def test_store_only_multi_connector_is_a_kv_pool(self):
+        # PD-Mixed topology: the pool is the only connector, and it moves the
+        # full (k, v, k_scale, v_scale) entry of each layer.
+        config = self._multi(
+            {
+                "kv_connector": "AscendStoreConnector",
+                "kv_role": "kv_both",
+                "kv_connector_extra_config": {"backend": "mooncake", "lookup_rpc_port": "0"},
+            }
+        )
+        self.assertTrue(utils.uses_kv_pool_connector(config))
+        self.assertFalse(utils.uses_mooncake_connector(config))
+
+    def test_bare_store_connector_is_a_kv_pool(self):
+        config = SimpleNamespace(kv_connector="AscendStoreConnector")
+        self.assertTrue(utils.uses_kv_pool_connector(config))
+
+    def test_store_alias_is_a_kv_pool(self):
+        config = SimpleNamespace(kv_connector="MooncakeConnectorStoreV1")
+        self.assertTrue(utils.uses_kv_pool_connector(config))
+
+    def test_store_connector_with_p2p_connector_is_not_store_only(self):
+        config = self._multi(
+            {"kv_connector": "MooncakeConnectorV1", "kv_role": "kv_producer"},
+            {"kv_connector": "AscendStoreConnector", "kv_role": "kv_producer"},
+        )
+        self.assertFalse(utils.uses_kv_pool_connector(config))
+        self.assertTrue(utils.uses_mooncake_connector(config))
+
+    def test_unknown_transport_connector_still_rejected(self):
+        config = self._multi(
+            {"kv_connector": "SomeOtherConnector", "kv_role": "kv_both"},
+            {"kv_connector": "AscendStoreConnector", "kv_role": "kv_both"},
+        )
+        self.assertFalse(utils.uses_kv_pool_connector(config))
+
+    def test_no_kv_transfer_config_is_not_a_kv_pool(self):
+        self.assertFalse(utils.uses_kv_pool_connector(None))
+
+
 @pytest.fixture
 def physical_device_lookup():
     with mock.patch("vllm.platforms.current_platform") as platform:

@@ -1630,6 +1630,24 @@ def uses_mooncake_connector(kv_transfer_config: Any) -> bool:
     return bool(_collect_kv_connector_names(kv_transfer_config) & mooncake_connector_names)
 
 
+_KV_POOL_CONNECTOR_NAMES = frozenset({"AscendStoreConnector", "MooncakeConnectorStoreV1"})
+
+
+def uses_kv_pool_connector(kv_transfer_config: Any) -> bool:
+    """Whether every KV-transfer connector in the config is a KV-pool store.
+
+    The AscendStore pool registers and moves the complete per-layer cache entry
+    (K, V and both C8-MXFP E8M0 scale caches) as block descriptors, so a
+    store-only config -- the PD-Mixed topology -- keeps the C8 layout
+    consistent without a Mooncake P2P connector. A config that adds any other
+    transport connector must still pass ``uses_mooncake_connector``.
+    """
+    connector_names = _collect_kv_connector_names(kv_transfer_config)
+    if not connector_names & _KV_POOL_CONNECTOR_NAMES:
+        return False
+    return not (connector_names - _KV_POOL_CONNECTOR_NAMES - {"MultiConnector"})
+
+
 def _collect_kv_connector_names(value: Any) -> set[str]:
     connector_names: set[str] = set()
     if isinstance(value, dict):
