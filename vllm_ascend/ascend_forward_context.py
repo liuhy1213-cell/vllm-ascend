@@ -33,6 +33,8 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
+_MRV2_DRAFT_FORWARD: ContextVar[bool] = ContextVar("_MRV2_DRAFT_FORWARD", default=False)
+
 
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
@@ -82,6 +84,29 @@ def override_mrv2_in_profile_run(enabled: bool):
 
 def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
+
+
+@contextmanager
+def override_mrv2_draft_forward(enabled: bool):
+    """Mark the current MRv2 forward path as belonging to the draft model.
+
+    MRv2 builds the base forward context inside upstream vLLM, and the
+    speculator's _run_model passes the target vllm_config, so Ascend's
+    platform hook cannot tell a draft forward from a target one. A
+    ContextVar keeps this MRv2-only state scoped to the draft
+    forward/capture paths; the hook forwards it to
+    select_moe_comm_method so the A5 mega moe guard also applies to the
+    draft MoE.
+    """
+    token = _MRV2_DRAFT_FORWARD.set(enabled)
+    try:
+        yield
+    finally:
+        _MRV2_DRAFT_FORWARD.reset(token)
+
+
+def get_mrv2_draft_forward() -> bool:
+    return _MRV2_DRAFT_FORWARD.get()
 
 
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
@@ -347,7 +372,16 @@ def _select_capacity_and_world_size_moe_comm_method(
                 # quantized weight layouts. An unquantized (or unsupported-quantized)
                 # MTP draft MoE layer must skip FUSED_MC2 and fall through to the
                 # original MoE path (MC2/ALLGATHER/ALLTOALL) below.
-                pass
+                # The shared capacity is sized for mega moe (up to
+                # _MEGA_MOE_TOKENS_PER_RANK_LIMIT per rank), but the regular MC2
+                # dispatch only accepts _MC2_TOKENS_PER_RANK_LIMIT per rank.
+                # Clamp it here so a large draft prefill chunk falls through to
+                # ALLGATHER/ALLTOALL instead of selecting MC2 and failing in the
+                # dispatch tiling.
+                mc2_tokens_capacity = min(
+                    mc2_tokens_capacity,
+                    _MC2_TOKENS_PER_RANK_LIMIT * vllm_config.parallel_config.tensor_parallel_size,
+                )
             else:
                 return MoECommType.FUSED_MC2
     num_experts_per_tok = getattr(
