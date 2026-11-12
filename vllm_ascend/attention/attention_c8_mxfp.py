@@ -49,7 +49,7 @@ from vllm_ascend.attention.utils import enable_dcp, enable_pcp, notify_kv_cache_
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     record_attention_compute_start,
 )
-from vllm_ascend.utils import uses_mooncake_connector
+from vllm_ascend.utils import uses_kv_pool_connector, uses_mooncake_connector
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -913,16 +913,19 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             return output.fill_(0)
         if getattr(self, "enable_hamming_sparse", False):
             raise NotImplementedError("C8_MXFP attention does not support hamming sparse KV compression yet.")
-        if self.vllm_config.kv_transfer_config is not None and not uses_mooncake_connector(
-            self.vllm_config.kv_transfer_config
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is not None and not (
+            uses_mooncake_connector(kv_transfer_config) or uses_kv_pool_connector(kv_transfer_config)
         ):
-            # Other connectors move only the K/V pair and would silently drop
-            # the scale caches.
+            # Connectors that move only the K/V pair would silently drop the
+            # scale caches. The KV-pool store connector is allowed as well: it
+            # registers the whole (k, v, k_scale, v_scale) entry of every layer
+            # as block descriptors (pool_worker._as_cache_tuple).
             raise NotImplementedError(
                 "C8_MXFP v1 PD disaggregation (kv_transfer) is only supported with "
-                "MooncakeConnectorV1, whose block-level transfer registers and moves "
-                "every per-layer cache tensor (FP8 K/V plus both E8M0 scale caches) "
-                "as raw blocks."
+                "MooncakeConnectorV1 or a store-only AscendStoreConnector KV pool, "
+                "whose block-level transfer registers and moves every per-layer cache "
+                "tensor (FP8 K/V plus both E8M0 scale caches) as raw blocks."
             )
         if kv_cache is None or len(kv_cache) < 4:
             raise RuntimeError(
