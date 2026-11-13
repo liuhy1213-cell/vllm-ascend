@@ -1115,7 +1115,17 @@ def _allocate_kv_cache(
         return kv_cache_raw_tensors
     has_mamba = any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())
     has_attention = any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
-    use_hybrid_layout = has_mamba and has_attention
+    # Multi-group pure-attention models (e.g. an mxfp8 full-attention group
+    # plus a higher-precision sliding-window group under HMA) receive the
+    # same aliased descriptors as hybrid models: every KVCacheTensor is a
+    # view into one common backing of identical size, and a block ID belongs
+    # to one group at a time. Allocate that backing once; allocating
+    # tensor.size per descriptor duplicates the whole pool and OOMs.
+    aliased_multi_group = (
+        len(kv_cache_config.kv_cache_groups) > 1
+        and len({tensor.size for tensor in kv_cache_config.kv_cache_tensors}) == 1
+    )
+    use_hybrid_layout = (has_mamba and has_attention) or aliased_multi_group
     is_glm5_next = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_kv_cache_spec.values())
 
     # The restored DeepSeek-V4 planner on main computes capacity for one
