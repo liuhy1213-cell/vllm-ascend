@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_
 from vllm.v1.worker.gpu.spec_decode.dspark import speculator as dspark_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator
 
+from vllm_ascend.patch.worker.patch_v2.patch_request_state import patch_request_state_draft_tokens
 from vllm_ascend.ops.triton.v2.apply_grammar_bitmask import _apply_grammar_bitmask_kernel
 from vllm_ascend.ops.triton.v2.mamba.precopy import precopy_mamba_align_fused_kernel
 from vllm_ascend.ops.triton.v2.metrics.num_nans import get_num_nans
@@ -78,3 +79,5 @@ output.SamplingMaskTensors.from_logits = classmethod(sampling_mask_from_logits_n
 thinking_budget._load_effective_token = _load_effective_token_ascend
 # TODO: Remove after Triton-Ascend 3.6.0 is the minimum supported version.
 thinking_budget._update_committed_marker_cache_kernel = _update_committed_marker_cache_kernel_ascend
+
+patch_request_state_draft_tokens()
