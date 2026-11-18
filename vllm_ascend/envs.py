@@ -82,10 +82,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
-    # Use the Triton MXFP8 sliding-window attention kernel for C8 sliding
-    # layers instead of QFA (prototype; the installed ops-transformer QFA
-    # rejects SLIDING_WINDOW). Default: 0 (disabled). Valid values: 0 or 1.
-    "VLLM_ASCEND_SLIDING_C8_TRITON": lambda: _strict_binary_env("VLLM_ASCEND_SLIDING_C8_TRITON"),
     # Fuse K/V MXFP8 quantization and the PA_NZ packet scatter into one
     # Triton kernel for C8 layers. Default: 0 (disabled). Valid values: 0/1.
     "VLLM_ASCEND_C8_FUSED_QUANT_SCATTER": lambda: _strict_binary_env("VLLM_ASCEND_C8_FUSED_QUANT_SCATTER"),

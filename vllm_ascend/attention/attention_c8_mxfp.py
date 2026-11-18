@@ -1131,39 +1131,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
 
                 self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
 
-        # Prototype: the installed ops-transformer QFA rejects SLIDING_WINDOW,
-        # so sliding C8 layers can run a Triton kernel over the same packet
-        # cache (dequantized to BF16 inside the kernel).
-        if self.sliding_window is not None and envs.VLLM_ASCEND_SLIDING_C8_TRITON:
-            from vllm_ascend.ops.triton.mxfp8_sliding_attention import mxfp8_sliding_attention
-
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            lse = mxfp8_sliding_attention(
-                query_mxfp8,
-                query_scale,
-                kv_cache,
-                attn_metadata,
-                output,
-                self.scale,
-                self.sliding_window,
-                layer.v_cache_scale,
-            )
-            if sink_key is not None:
-                from vllm_ascend.ops.triton.sink import sink_apply_triton
-
-                sink_apply_triton(
-                    query[:num_actual_tokens],
-                    output[:num_actual_tokens],
-                    lse,
-                    sink_key,
-                    self.scale,
-                    num_actual_tokens,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_size,
-                )
-            return output
-
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
         return self._forward_mxfp8_attention(
