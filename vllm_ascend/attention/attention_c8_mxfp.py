@@ -965,7 +965,13 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 self._kv_center_off = True
                 return None, sink_key
             lidx = int(m.group(1))
-            rank = dist.get_rank() if dist.is_initialized() else 0
+            # The calibration files are sliced by *tensor-parallel* rank (KV
+            # heads are sharded by TP), so a data-parallel or pipeline offset
+            # must not leak into the file name: dist.get_rank() would look for
+            # layer-{8}.pt on the second DP group and silently miss.
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            rank = get_tensor_model_parallel_rank() if dist.is_initialized() else 0
 
             cand = []
             env_dir = os.environ.get("C8_KV_CENTER_DIR")
