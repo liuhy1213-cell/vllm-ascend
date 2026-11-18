@@ -39,6 +39,10 @@ from vllm.v1.attention.backend import (  # type: ignore
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -892,6 +896,68 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         )
         notify_kv_cache_written()
 
+    def _apply_kv_center(self, layer, query, sink_key):
+        """按层加载 K 中心化向量并作用到 sink_key；未启用时原样返回。
+
+        μ 是量化阶段在标定集上统计的 post-rope K 逐通道均值，随成品包一起提供
+        （``<model_path>/kv_center/{layer}-{rank}.pt``，第 0 项为 μ）。也可用环境变量
+        ``C8_KV_CENTER_DIR`` 指定临时目录。``C8_KV_CENTER=0`` 强制关闭。
+        文件缺失时只告警一次并全程关闭，不影响其它功能。
+        """
+        if getattr(self, "_kv_center_off", False):
+            return None, sink_key
+        center = getattr(self, "_kv_center", None)
+        if center is None:
+            import re
+
+            import torch.distributed as dist
+            from pathlib import Path
+
+            from vllm.config import get_current_vllm_config
+
+            m = re.search(r"layers\.(\d+)\.", getattr(layer, "layer_name", "") or "")
+            if m is None:
+                logger.warning_once(
+                    "[kv_center] 无法从 layer_name 解析层号（%r），K 中心化关闭",
+                    getattr(layer, "layer_name", None),
+                )
+                self._kv_center_off = True
+                return None, sink_key
+            lidx = int(m.group(1))
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+            cand = []
+            env_dir = os.environ.get("C8_KV_CENTER_DIR")
+            if env_dir:
+                cand.append(Path(env_dir))
+            try:
+                cand.append(Path(get_current_vllm_config().model_config.model) / "kv_center")
+            except Exception:  # noqa: BLE001
+                pass
+            hit = next((p / f"{lidx}-{rank}.pt" for p in cand if (p / f"{lidx}-{rank}.pt").exists()), None)
+            if hit is None:
+                if os.environ.get("C8_KV_CENTER") == "1":
+                    raise RuntimeError(
+                        f"[kv_center] C8_KV_CENTER=1 但找不到 layer {lidx} rank {rank} 的校准文件"
+                        f"（已查找: {[str(p) for p in cand]}）"
+                    )
+                logger.warning_once(
+                    "[kv_center] 未找到 K 中心化校准文件，已关闭（查找目录: %s）",
+                    [str(p) for p in cand],
+                )
+                self._kv_center_off = True
+                return None, sink_key
+
+            cal = torch.load(hit, weights_only=True, map_location="cpu")
+            self._kv_center = cal[0].to(device=query.device, dtype=query.dtype)
+            center = self._kv_center
+            if sink_key is not None:
+                # 只算一次：sink_key 与 μ 都不随 token 变化
+                self._centered_sink = sink_key.float() - center.reshape_as(sink_key).float()
+        if sink_key is not None:
+            sink_key = getattr(self, "_centered_sink", sink_key)
+        return center, sink_key
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -945,6 +1011,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         sink_key = getattr(layer, "sink_key", None)
         if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
             sink_key = None
+        # ---- K 中心化 ----
+        # <q, k-mu> = <q,k> - <q,mu>，后者只与 query 相关，softmax 不变；
+        # sink 必须减同一个 mu，才能保持 sink 列与 key 列的相对权重。
+        _kv_center, sink_key = self._apply_kv_center(layer, query, sink_key)
         sink_logits = None
         if sink_key is not None:
             num_actual_tokens = attn_metadata.num_actual_tokens
@@ -967,8 +1037,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
+            _key_in = key[: attn_metadata.num_actual_tokens]
+            if _kv_center is not None:
+                _key_in = (_key_in.reshape(-1, self.num_kv_heads, self.head_size)
+                           - _kv_center).reshape_as(_key_in)
             key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                key[: attn_metadata.num_actual_tokens],
+                _key_in,
                 dst_type=torch.float8_e4m3fn,
             )
 
