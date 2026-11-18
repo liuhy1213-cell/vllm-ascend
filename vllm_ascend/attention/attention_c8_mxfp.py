@@ -742,7 +742,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             value_scale,
             quant_mode,
             block_table=attn_metadata.block_tables,
-            p_scale=None,
+            p_scale=_qfa_p_scale(quant_query.device),
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=None,
             seqused_q=None,
@@ -958,6 +958,130 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         )
         notify_kv_cache_written()
 
+    def _kv_center_model_path(self):
+        """Resolve the served model path once, robust to a missing context var.
+
+        In a worker process ``get_current_vllm_config()`` is not always set
+        (it raises), and the old code swallowed that exception, leaving the
+        candidate list empty -- so a package that shipped ``kv_center/`` still
+        reported "calibration file not found".
+        """
+        cached = getattr(self, "_kv_center_model_path_cache", None)
+        if cached is not None:
+            return cached or None
+        path = ""
+        # The base impl stores the config at construction time; forward() runs
+        # without the config context var, so this is the only reliable source.
+        cfg = getattr(self, "vllm_config", None)
+        if cfg is not None:
+            path = getattr(cfg.model_config, "model", "") or ""
+        if not path:
+            try:
+                from vllm.config import get_current_vllm_config_or_none
+
+                cfg = get_current_vllm_config_or_none()
+                if cfg is not None:
+                    path = getattr(cfg.model_config, "model", "") or ""
+            except Exception:  # noqa: BLE001
+                path = ""
+        self._kv_center_model_path_cache = path
+        return path or None
+
+    def _apply_kv_center(self, layer, query, sink_key):
+        """Load this layer's K-centering vector and apply it to sink_key.
+
+        μ is the per-channel mean of post-rope K, collected offline on the
+        calibration set and shipped with the package
+        (``<model_path>/kv_center/{layer}-{rank}.pt``, item 0 is μ; an
+        un-sliced ``{layer}.pt`` is accepted too and sliced by the actual TP
+        layout). ``C8_KV_CENTER_DIR`` overrides the directory.
+
+        Centering is required whenever a C8-MXFP layer runs: serving without
+        it reproduces the early-EOS truncation it exists to fix, and centering
+        only some layers changes the relative weight of the keys. A missing
+        table therefore raises instead of degrading silently; set
+        ``C8_KV_CENTER=0`` to opt out on purpose.
+        """
+        if getattr(self, "_kv_center_off", False):
+            return None, sink_key
+        if os.environ.get("C8_KV_CENTER") == "0":
+            return None, sink_key
+        center = getattr(self, "_kv_center", None)
+        if center is None:
+            import re
+
+            import torch.distributed as dist
+            from pathlib import Path
+
+            m = re.search(r"layers\.(\d+)\.", getattr(layer, "layer_name", "") or "")
+            if m is None:
+                raise RuntimeError(
+                    "[kv_center] cannot parse a layer index from layer_name=%r; "
+                    "set C8_KV_CENTER=0 to disable K centering explicitly"
+                    % (getattr(layer, "layer_name", None),)
+                )
+            lidx = int(m.group(1))
+            # The calibration files are sliced by *tensor-parallel* rank (KV
+            # heads are sharded by TP), so a data-parallel or pipeline offset
+            # must not leak into the file name: dist.get_rank() would look for
+            # layer-{8}.pt on the second DP group and silently miss.
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            rank = get_tensor_model_parallel_rank() if dist.is_initialized() else 0
+
+            cand = []
+            env_dir = os.environ.get("C8_KV_CENTER_DIR")
+            if env_dir:
+                cand.append(Path(env_dir))
+            model_path = self._kv_center_model_path()
+            if model_path is not None:
+                cand.append(Path(model_path) / "kv_center")
+            hit = next((p / f"{lidx}-{rank}.pt" for p in cand if (p / f"{lidx}-{rank}.pt").exists()), None)
+            full = None if hit is not None else next(
+                (p / f"{lidx}.pt" for p in cand if (p / f"{lidx}.pt").exists()), None
+            )
+            if hit is None and full is None:
+                if not cand:
+                    raise RuntimeError(
+                        "[kv_center] no candidate directory: the model path could not be "
+                        "resolved and C8_KV_CENTER_DIR is unset. Point C8_KV_CENTER_DIR at "
+                        "<package>/kv_center, or set C8_KV_CENTER=0 to opt out."
+                    )
+                raise RuntimeError(
+                    f"[kv_center] layer {lidx} (tp rank {rank}): no calibration file under "
+                    f"{[str(p) for p in cand]}. Re-run the quantization step 3 "
+                    "(--layers all) or set C8_KV_CENTER=0 to opt out."
+                )
+
+            if hit is not None:
+                cal = torch.load(hit, weights_only=True, map_location="cpu")
+                mu = cal[0]
+            else:
+                # Un-sliced table: <layer>.pt holds [2, num_kv_heads, head_dim]
+                # and is sliced here by the *actual* TP layout, so a package
+                # stays valid when the tensor-parallel size changes.
+                from vllm.distributed import get_tensor_model_parallel_world_size
+
+                cal = torch.load(full, weights_only=True, map_location="cpu")
+                mu = cal[0].reshape(-1, self.head_size)
+                tp_size = get_tensor_model_parallel_world_size()
+                if tp_size > 1:
+                    if mu.shape[0] % tp_size:
+                        raise RuntimeError(
+                            f"[kv_center] layer {lidx}: {mu.shape[0]} kv heads cannot be "
+                            f"split across TP={tp_size}"
+                        )
+                    per = mu.shape[0] // tp_size
+                    mu = mu[rank * per : (rank + 1) * per]
+            self._kv_center = mu.to(device=query.device, dtype=query.dtype)
+            center = self._kv_center
+            if sink_key is not None:
+                # Computed once: neither sink_key nor μ varies with the tokens.
+                self._centered_sink = sink_key.float() - center.reshape_as(sink_key).float()
+        if sink_key is not None:
+            sink_key = getattr(self, "_centered_sink", sink_key)
+        return center, sink_key
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -1012,6 +1136,13 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
             sink_key = None
 
+        # ---- K centering ----
+        # <q, k-mu> = <q,k> - <q,mu>, and the second term depends only on the
+        # query, so the softmax is unchanged. sink_key must subtract the same
+        # mu, otherwise the sink column keeps its old weight relative to the
+        # key columns.
+        _kv_center, sink_key = self._apply_kv_center(layer, query, sink_key)
+
         record_attention_compute_start()
 
         query_mxfp8, query_scale = torch_npu.npu_dynamic_mx_quant(
@@ -1023,6 +1154,13 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
+            # Center K before quantization; both the fused Triton path and the
+            # native quantize/scatter path below consume this tensor.
+            key_in = key
+            if _kv_center is not None:
+                key_in = (
+                    key.reshape(-1, self.num_kv_heads, self.head_size) - _kv_center
+                ).reshape_as(key)
             # The fused Triton kernel wins on decode-sized batches (one tiny
             # program per token/head) but its per-program dispatch loses to
             # the native quantize/scatter tiling on large prefill chunks, so
@@ -1036,7 +1174,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
 
                 num_actual_tokens = attn_metadata.num_actual_tokens
                 quant_scatter_mxfp8(
-                    key[:num_actual_tokens],
+                    key_in[:num_actual_tokens],
                     value[:num_actual_tokens],
                     layer.v_cache_scale_float_reciprocal,
                     kv_cache[0],
@@ -1047,7 +1185,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 notify_kv_cache_written()
             else:
                 key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                    key[: attn_metadata.num_actual_tokens],
+                    key_in[: attn_metadata.num_actual_tokens],
                     dst_type=torch.float8_e4m3fn,
                 )
 
