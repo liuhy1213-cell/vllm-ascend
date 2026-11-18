@@ -476,12 +476,11 @@ class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
         return AttentionCGSupport.ALWAYS
 
 
+# Standard A8C8 MXFP8 mode (FP32 softmax). Sliding-window layers use it too:
+# the mask-mode/quant-mode checker restriction is lifted by the patched
+# ops-transformer (cann/ops-transformer PR #16121), so no FP16-softmax
+# fallback is needed.
 QFA_QUANT_MODE_MXFP8 = 1
-# QFA quant modes share the Q/K/V MXFP8 cache format; only the P quantization
-# and softmax precision differ. The installed ops-transformer checker forbids
-# SLIDING_WINDOW for the FP32-softmax MXFP8 mode (1); the FP16-softmax mode (3)
-# keeps P FP8 E4M3 per-tensor like mode 1 and is not in the forbidden list.
-QFA_QUANT_MODE_MXFP8_FP16 = 3
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
 QFA_MASK_MODE_SLIDING_WINDOW = 4
@@ -858,11 +857,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             win_left = -1
             win_right = -1
 
-        # The FP32-softmax MXFP8 mode rejects SLIDING_WINDOW in the installed
-        # ops-transformer; the FP16-softmax variant keeps the same cache/P
-        # format and accepts the band mask.
-        # All C8 layers use the standard A8C8 MXFP8 mode. The patched
-        # ops-transformer allows SLIDING_WINDOW for this mode.
+        # All C8 layers (full attention and sliding window) use the standard
+        # A8C8 MXFP8 mode with FP32 softmax. SLIDING_WINDOW for this mode
+        # requires the patched ops-transformer (cann/ops-transformer PR #16121:
+        # checker relaxation + BAND left-boundary mask fix).
         quant_mode = QFA_QUANT_MODE_MXFP8
 
         # Both operators have to agree on the q scale layout: it is what
