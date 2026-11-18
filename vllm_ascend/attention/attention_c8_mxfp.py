@@ -982,9 +982,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                         f"[kv_center] C8_KV_CENTER=1 但找不到 layer {lidx} rank {rank} 的校准文件"
                         f"（已查找: {[str(p) for p in cand]}）"
                     )
+                # vLLM's warning_once keys its "log only once" cache on the
+                # arguments, so a list raises TypeError: unhashable type.
                 logger.warning_once(
                     "[kv_center] 未找到 K 中心化校准文件，已关闭（查找目录: %s）",
-                    [str(p) for p in cand],
+                    ", ".join(str(p) for p in cand),
                 )
                 self._kv_center_off = True
                 return None, sink_key
