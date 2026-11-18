@@ -906,6 +906,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         if getattr(self, "_kv_center_off", False):
             return None, sink_key
+        if os.environ.get("C8_KV_CENTER") == "0":
+            return None, sink_key
         center = getattr(self, "_kv_center", None)
         if center is None:
             import re
