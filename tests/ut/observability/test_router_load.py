@@ -198,11 +198,14 @@ def test_http_contract_alias_sections_errors_and_dp_failure():
                 assert response.status_code == 200
                 load = response.json()["loads"][0]
                 assert {"dp_rank", "num_running_reqs", "num_waiting_reqs", "disaggregation", "router_load"} <= set(load)
-                assert len(load["router_load"]) == 16
+                assert load["router_load"]["schema_version"] == 2
             response = await client.get("/v1/loads?include=core")
             assert "router_load" not in response.json()["loads"][0]
             assert "num_running_reqs" in response.json()["loads"][0]
             assert (await client.get("/v1/loads?include=unknown")).status_code == 400
+            # Simulate failure with no valid cached snapshot available.
+            reader = app.state.ascend_router_load_reader
+            reader.cached = None
             core.call_utility_async.side_effect = RuntimeError("engine unavailable")
             response = await client.get("/v1/loads")
             assert response.status_code == 503 and "loads" not in response.json()
