@@ -839,10 +839,21 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # raises it, so an inflated value is never walked back.
         max_seqlen_q = attn_metadata.max_query_len or num_tokens
 
-        # Sliding-window layers let QFA enforce the window itself: win_left
-        # counts the tokens left of the diagonal (self excluded), matching
-        # FIA's pre_tokens=sliding_window / next_tokens=0. The mask stays
-        # attached because QFA requires attn_mask for every non-NO_MASK mode.
+        # Sliding-window layers let QFA enforce the window itself. QFA's
+        # ``win_left`` counts the tokens left of the diagonal (self excluded),
+        # so ``win_left = sliding_window - 1`` yields ``sliding_window``
+        # tokens including the query itself -- the HF definition
+        # (transformers.masking_utils: ``kv_idx > q_idx - sliding_window``)
+        # and the one used by the official GPU implementation
+        # (vLLM FlashAttentionImpl stores ``(sliding_window - 1, 0)`` and
+        # FlashAttention's window_size is inclusive on both ends).
+        # NOTE: the BF16 FIA path in this repo passes
+        # ``pre_tokens = sliding_window`` (i.e. one extra token). That is a
+        # pre-existing Ascend-side discrepancy (present since the first
+        # sliding-window support, 2025-08); this backend intentionally matches
+        # the model definition instead of copying it.
+        # The mask stays attached because QFA requires attn_mask for every
+        # non-NO_MASK mode.
         if self.sliding_window is not None:
             mask_mode = QFA_MASK_MODE_SLIDING_WINDOW
             win_left = self.sliding_window - 1
