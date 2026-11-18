@@ -43,6 +43,18 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+
+def _qfa_p_scale(device):
+    """Scale applied to P before the low-precision P*V product.
+
+    256 by default; ``C8_P_SCALE=0`` (or an empty value) restores the
+    operator's built-in behaviour, any other number overrides it.
+    """
+    v = os.environ.get("C8_P_SCALE", "256")
+    if not v or float(v) == 0.0:
+        return None
+    return torch.full((1,), float(v), device=device, dtype=torch.float32)
+
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -736,7 +748,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             value_scale,
             QFA_QUANT_MODE_MXFP8,
             block_table=attn_metadata.block_tables,
-            p_scale=None,
+            p_scale=_qfa_p_scale(quant_query.device),
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=None,
             seqused_q=None,
