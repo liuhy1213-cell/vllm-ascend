@@ -820,10 +820,9 @@ class AscendModelSlimConfig(QuantizationConfig):
         """
         from vllm.model_executor.layers.attention import Attention
 
-        return (
-            isinstance(layer, Attention)
-            and getattr(layer, "sliding_window", None) is None
-        )
+        # 滑窗层现在也走 C8-MXFP（QFA 已支持 mask_mode=4 的 MXFP8 滑窗）：
+        # 缓存侧由 mxfp_cache_spec 统一成 FP8 包页，V 尺度缺失时用中性 127。
+        return isinstance(layer, Attention)
 
     @property
     def enable_mxfp_c8_quant(self) -> bool:

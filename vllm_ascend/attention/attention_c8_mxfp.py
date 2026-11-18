@@ -37,7 +37,7 @@ from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm.logger import init_logger
 
@@ -185,7 +185,9 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
-def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
+def mxfp_cache_spec(
+    spec: "FullAttentionSpec | SlidingWindowSpec",
+    ) -> "FullAttentionSpec | SlidingWindowSpec":
     """Budget scales through upstream state_content_bytes, preserving real D."""
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
@@ -212,7 +214,13 @@ def is_mxfp_cache_spec(spec: "KVCacheSpec") -> bool:
     BF16 layers. ``mxfp_cache_spec`` is what marks a layer as MXFP8, and it
     rewrites the dtype, so test the dtype instead of the global flag.
     """
-    return type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
+    # 全层 C8（不带 --kv-cache-dtype-skip-layers）时滑窗 spec 也要转换：
+    # 它在 get_kv_cache_spec 里还是 SlidingWindowSpec（带 hybrid manager 时
+    # 一直是；禁用时 vLLM 之后再提升成 FullAttentionSpec）。两种形态都要认。
+    return (
+        type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+        and spec.dtype == torch.float8_e4m3fn
+    )
 
 
 def mxfp_paged_cache_views(
@@ -473,6 +481,9 @@ class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
 QFA_QUANT_MODE_MXFP8 = 1
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
+# 4 = 滑窗（attr win_left/win_right 生效；win_left 语义与 FIA 的
+# pre_tokens 一致，即「向前包含 win_left 个 token + 自己」）。
+QFA_MASK_MODE_SLIDING_WINDOW = 4
 QFA_LAYOUT_TND = "TND"
 QFA_LAYOUT_N2TGD = "N2TGD"
 QFA_LAYOUT_PA_NZ = "PA_NZ"
@@ -588,6 +599,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         seqused_kv: torch.Tensor,
         max_seqlen_q: int,
         mask_mode: int,
+        win_left: int,
+        win_right: int,
         layout_q_descale: str,
     ):
         """Return the QFA metadata plan (AICPU op output), derived once a step.
@@ -606,6 +619,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             self.head_size,
             max_seqlen_q,
             mask_mode,
+            win_left,
+            win_right,
             layout_q_descale,
         )
         metadata = cache.get(plan_key)
@@ -627,8 +642,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=-1,
                 mask_mode=mask_mode,
-                win_left=-1,
-                win_right=-1,
+                win_left=win_left,
+                win_right=win_right,
                 layout_q=QFA_LAYOUT_TND,
                 layout_q_descale=layout_q_descale,
                 layout_kv=QFA_LAYOUT_PA_NZ,
@@ -689,6 +704,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         qfa_metadata,
         max_seqlen_q: int,
         mask_mode: int,
+        win_left: int,
+        win_right: int,
         layout_q_descale: str,
         num_tokens: int,
         output: torch.Tensor,
@@ -731,8 +748,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             metadata=qfa_metadata,
             softmax_scale=self.scale,
             mask_mode=mask_mode,
-            win_left=-1,
-            win_right=-1,
+            win_left=win_left,
+            win_right=win_right,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=-1,
             layout_q=QFA_LAYOUT_TND,
@@ -785,8 +802,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         if not attn_metadata.causal:
             raise NotImplementedError("C8_MXFP attention does not support non-causal attention yet.")
-        if self.sliding_window is not None:
-            raise NotImplementedError("C8_MXFP attention does not support sliding window attention yet.")
 
         # T as QFA sees it: the query rows actually fed to the operator
         # (forward slices query[:num_actual_tokens] before quantizing), so
@@ -817,7 +832,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # a kernel template that never reads the mask; at Q_S == 1 that is
         # exactly equivalent to CAUSAL (the KV range is bounded by seqused_kv).
         # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
-        mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+        # 滑窗层必须始终带窗口：decoder 单 token 时 CAUSAL/NO_MASK 都会让 query
+        # 看到全部历史。QFA 的 win_left 与 FIA 的 pre_tokens 同义（已用等价性
+        # 测试对齐：win_left=P 与 FIA(pre_tokens=P) 一致，P-1 不一致）。
+        if self.sliding_window is not None:
+            mask_mode = QFA_MASK_MODE_SLIDING_WINDOW
+            win_left, win_right = self.sliding_window, 0
+        else:
+            mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+            win_left, win_right = -1, -1
 
         # Both operators have to agree on the q scale layout: it is what
         # picks the kernel, and the metadata plan is computed for that kernel.
@@ -829,6 +852,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             seqused_kv=seqused_kv,
             max_seqlen_q=max_seqlen_q,
             mask_mode=mask_mode,
+            win_left=win_left,
+            win_right=win_right,
             layout_q_descale=layout_q_descale,
         )
         return self._run_qfa(
@@ -841,6 +866,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             qfa_metadata=qfa_metadata,
             max_seqlen_q=max_seqlen_q,
             mask_mode=mask_mode,
+            win_left=win_left,
+            win_right=win_right,
             layout_q_descale=layout_q_descale,
             num_tokens=num_tokens,
             output=output,
