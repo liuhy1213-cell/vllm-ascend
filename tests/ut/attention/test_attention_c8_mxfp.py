@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend.attention import attention_c8_mxfp
 from vllm_ascend.attention.attention_c8_mxfp import AscendC8MXFPAttentionBackendImpl
 
 
@@ -284,8 +285,8 @@ class TestC8MXFPQfaMetadataPlan(TestBase):
             "mask_mode": 0,
             "layout_q_descale": "N2TGD",
         }
-        ops_module = MagicMock(quant_flash_attn_metadata=metadata_op)
-        with patch.dict("sys.modules", {"cann_ops_transformer.ops": ops_module}):
+        ops_module = MagicMock(npu_quant_flash_attn_vllm_metadata=metadata_op)
+        with patch.object(attention_c8_mxfp, "_qfa_ops", return_value=ops_module):
             plans = [self.impl._get_qfa_metadata(attn_metadata, **{**defaults, **call}) for call in calls]
         return plans, invocations
 
