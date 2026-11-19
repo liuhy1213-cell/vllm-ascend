@@ -56,6 +56,19 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
+def _qfa_p_scale(device):
+    """Scale applied to P before the low-precision P*V product.
+
+    256 by default (matching the kcenter-p256 tuning branch); ``C8_P_SCALE=0``
+    or an empty value restores the operator default, any other number
+    overrides it.
+    """
+    v = os.environ.get("C8_P_SCALE", "256")
+    if not v or float(v) == 0.0:
+        return None
+    return torch.full((1,), float(v), device=device, dtype=torch.float32)
+
+
 
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden
 # reference: quant_flash_attn_golden.py "PA_NZ: fp8=[Bn,N,D//32,Bs,32],
