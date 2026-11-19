@@ -1001,7 +1001,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         only some layers changes the relative weight of the keys. A missing
         table therefore raises instead of degrading silently; set
         ``C8_KV_CENTER=0`` to opt out on purpose.
+
+        ``C8_KV_CENTER=full`` centers only the full-attention layers (the 25
+        layers the original recipe calibrated) and leaves every sliding-window
+        layer uncentered. Use it to reproduce the 25-layer configuration while
+        those layers still run C8.
         """
+        if os.environ.get("C8_KV_CENTER") == "full" and self.sliding_window is not None:
+            return None, sink_key
         if getattr(self, "_kv_center_off", False):
             return None, sink_key
         if os.environ.get("C8_KV_CENTER") == "0":
