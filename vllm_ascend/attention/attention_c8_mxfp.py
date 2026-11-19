@@ -892,6 +892,73 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         )
         notify_kv_cache_written()
 
+    def _kv_center_table(self, layer_index: int):
+        """Read <model>/kv_center/<layer>.pt and slice it for this TP rank.
+
+        The table is the un-sliced [2, num_kv_heads, head_dim] tensor produced
+        by the quantization step (item 0 is mu, item 1 is the mean |k|). KV
+        heads are sharded contiguously by tensor parallelism, so this rank owns
+        rows [rank*per, (rank+1)*per).
+        """
+        import torch.distributed as dist
+        from pathlib import Path
+
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        model_path = getattr(self.vllm_config.model_config, "model", "") or ""
+        path = Path(model_path) / "kv_center" / f"{layer_index}.pt"
+        if not path.exists():
+            raise RuntimeError(
+                f"[kv_center] layer {layer_index}: {path} is missing. K centering is "
+                "mandatory for every C8-MXFP full-attention layer; re-run the "
+                "quantization step 3 or point --model at a package that ships it."
+            )
+        mu = torch.load(path, weights_only=True, map_location="cpu")[0]
+        mu = mu.reshape(-1, self.head_size)
+        tp_size = get_tensor_model_parallel_world_size() if dist.is_initialized() else 1
+        if tp_size > 1:
+            if mu.shape[0] % tp_size:
+                raise RuntimeError(
+                    f"[kv_center] layer {layer_index}: {mu.shape[0]} kv heads cannot be "
+                    f"split across TP={tp_size}"
+                )
+            per = mu.shape[0] // tp_size
+            rank = get_tensor_model_parallel_rank()
+            mu = mu[rank * per : (rank + 1) * per]
+        return mu
+
+    def _apply_kv_center(self, layer, query, sink_key):
+        """Center K for full-attention C8 layers; windowed layers have no table.
+
+        Only the full-attention layers are calibrated: their K is where the
+        32-channel MX block scale gets hijacked by per-channel offsets. The
+        sliding-window layers keep their uncentered quantization, and BF16 KV
+        layers never reach this code at all.
+        """
+        if self.sliding_window is not None:
+            return None, sink_key
+        center = getattr(self, "_kv_center", None)
+        if center is None:
+            import re
+
+            match = re.search(r"layers\.(\d+)\.", getattr(layer, "layer_name", "") or "")
+            if match is None:
+                raise RuntimeError(
+                    "[kv_center] cannot parse a layer index from layer_name=%r"
+                    % (getattr(layer, "layer_name", None),)
+                )
+            mu = self._kv_center_table(int(match.group(1)))
+            center = mu.to(device=query.device, dtype=query.dtype)
+            self._kv_center = center
+            if sink_key is not None:
+                self._centered_sink = sink_key.float() - center.reshape_as(sink_key).float()
+        if sink_key is not None:
+            sink_key = getattr(self, "_centered_sink", sink_key)
+        return center, sink_key
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -940,11 +1007,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # (same formula as the FIA path in vllm_ascend.models.iquest_q1.
         # attention). sink_logit = scale * (q . sink_k[kv head]) on the raw
         # bf16 query, computed before dynamic quantization.
-        # C8_DISABLE_SINK=1 skips the correction (A/B diagnostic for the QFA
-        # LSE convention).
         sink_key = getattr(layer, "sink_key", None)
-        if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
-            sink_key = None
+        # K centering: only full-attention layers carry a calibration table.
+        # <q, k-mu> = <q,k> - <q,mu>, and the second term depends only on the
+        # query, so the softmax is unchanged. sink_key subtracts the same mu,
+        # otherwise the sink column keeps its old weight against the keys.
+        kv_center, sink_key = self._apply_kv_center(layer, query, sink_key)
         sink_logits = None
         if sink_key is not None:
             num_actual_tokens = attn_metadata.num_actual_tokens
@@ -967,8 +1035,13 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
+            key_in = key
+            if kv_center is not None:
+                key_in = (
+                    key.reshape(-1, self.num_kv_heads, self.head_size) - kv_center
+                ).reshape_as(key)
             key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                key[: attn_metadata.num_actual_tokens],
+                key_in[: attn_metadata.num_actual_tokens],
                 dst_type=torch.float8_e4m3fn,
             )
 
