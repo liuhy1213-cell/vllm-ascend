@@ -116,12 +116,22 @@ def quant_scatter_mxfp8(
 ) -> None:
     """Quantize K/V to MXFP8 and scatter into the C8 packet caches.
 
-    ``key``/``value``: ``[T, N, D]`` bf16 (not yet quantized).
+    ``key``/``value``: ``[T, N, D]`` bf16 (not yet quantized). Non-contiguous
+    inputs are materialized to a contiguous layout first, because the kernel
+    addresses rows with the flat ``[T, N, D]`` stride.
     ``key_cache``/``value_cache``: 5-D PA_NZ views ``(Bn, N, D // 32, Bs, 32)``
     whose dim-0 stride is the full packet pitch.
     ``k_scale_cache``: 6-D view ``(Bn, N, Bs // 16, D // 64, 16, 2)``.
     ``slot_mapping``: ``[T]`` int32; negative slots (padding) are skipped.
     """
+    # Callers may hand over strided views: e.g. ``v`` stays a slice of the
+    # fused QKV output when enable_iquest_split_qkv_rmsnorm_rope is off, and
+    # ``k`` is a strided view before the K-centering subtraction. The kernel
+    # computes flat [T, N, D] addresses, so make the layout explicit here.
+    if not key.is_contiguous():
+        key = key.contiguous()
+    if not value.is_contiguous():
+        value = value.contiguous()
     num_tokens, num_heads, head_dim = key.shape
     if num_tokens == 0:
         return
