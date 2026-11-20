@@ -38,7 +38,6 @@ from vllm.v1.attention.backend import (  # type: ignore
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
-from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -1098,47 +1097,24 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 key_in = (
                     key.reshape(-1, self.num_kv_heads, self.head_size) - kv_center
                 ).reshape_as(key)
-            # The fused Triton kernel wins on decode-sized batches (one tiny
-            # program per token/head) but its per-program dispatch loses to
-            # the native quantize/scatter tiling on large prefill chunks, so
-            # keep the original path above the threshold (TTFT matters).
-            use_fused = (
-                envs.VLLM_ASCEND_C8_FUSED_QUANT_SCATTER
-                and attn_metadata.num_actual_tokens <= 2048
+            key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
+                key_in[: attn_metadata.num_actual_tokens],
+                dst_type=torch.float8_e4m3fn,
             )
-            if use_fused:
-                from vllm_ascend.ops.triton.mxfp_quant_scatter import quant_scatter_mxfp8
 
-                num_actual_tokens = attn_metadata.num_actual_tokens
-                quant_scatter_mxfp8(
-                    key_in[:num_actual_tokens],
-                    value[:num_actual_tokens],
-                    layer.v_cache_scale_float_reciprocal,
-                    kv_cache[0],
-                    kv_cache[1],
-                    kv_cache[2],
-                    attn_metadata.slot_mapping[:num_actual_tokens],
-                )
-                notify_kv_cache_written()
-            else:
-                key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                    key_in[: attn_metadata.num_actual_tokens],
-                    dst_type=torch.float8_e4m3fn,
-                )
+            original_value_shape = value.shape
+            value = value.view(original_value_shape[0], -1)
+            value_mxfp8 = torch_npu.npu_quantize(
+                value[: attn_metadata.num_actual_tokens],
+                layer.v_cache_scale_float_reciprocal,
+                None,
+                torch.float8_e4m3fn,
+                -1,
+                False,
+            )
+            value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
 
-                original_value_shape = value.shape
-                value = value.view(original_value_shape[0], -1)
-                value_mxfp8 = torch_npu.npu_quantize(
-                    value[: attn_metadata.num_actual_tokens],
-                    layer.v_cache_scale_float_reciprocal,
-                    None,
-                    torch.float8_e4m3fn,
-                    -1,
-                    False,
-                )
-                value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
-
-                self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
+            self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
