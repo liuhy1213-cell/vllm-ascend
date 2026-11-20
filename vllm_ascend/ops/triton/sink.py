@@ -38,10 +38,14 @@ in place.
 Numerics: bf16 products are exact in the fp32 accumulator, so versus the
 torch path the only differences are (a) fp32 summation order inside the
 dot product and (b) one ULP-level sigmoid difference - both far below the
-bf16 output quantum. The kernel hard-codes the torch path's intermediate
-bf16 roundings (sink cast, bmm output, factor cast) so the outputs stay
-bit-identical for the vast majority of elements (microbench on 950DT:
-100% bitwise over production-like and adversarial shapes).
+bf16 output quantum. By default (``EXACT_FP32=False``, the BF16 FIA path)
+the kernel reproduces the torch path's intermediate bf16 roundings (sink
+cast, bmm output, factor cast) so the outputs stay bit-identical for the
+vast majority of elements (microbench on 950DT: 100% bitwise over
+production-like and adversarial shapes). The C8-QFA caller sets
+``EXACT_FP32=True`` and ``LSE_HEAD_MAJOR=True``: it deliberately skips
+those roundings (the old C8 torch path accumulated in fp32) and indexes
+QFA's head-major ``[H, T]`` LSE directly.
 """
 
 import torch
@@ -61,7 +65,7 @@ def _triton_sink_apply(
     q_ptr,  # [T*H, D] bf16 (kv-major head layout, contiguous rows)
     out_ptr,  # [T*H, D] bf16, updated in place
     sink_ptr,  # [KV, D] fp32 master weights
-    lse_ptr,  # [T*H] fp32 (TND LSE flattened)
+    lse_ptr,  # [T*H] fp32 token-major (TND flattened), or [H, T] head-major
     scale,
     num_rows,
     num_tokens,
@@ -71,7 +75,7 @@ def _triton_sink_apply(
     BLOCK_ROWS: tl.constexpr,
     SINK_1D: tl.constexpr,  # single kv head: load the sink row once
     LSE_HEAD_MAJOR: tl.constexpr,  # lse is [H, T] (QFA) instead of [T*H]
-    EXACT_FP32: tl.constexpr,  # C8 torch path: no intermediate bf16 roundings
+    EXACT_FP32: tl.constexpr,  # C8-QFA path: no intermediate bf16 roundings
 ):
     # One program per BLOCK_ROWS tile, no row loop: each tile has a serial
     # load -> dot -> sigmoid -> store dependency chain, so per-program
@@ -150,23 +154,24 @@ def sink_apply_triton(
 ) -> None:
     """Fold the learned sink into ``attn_output[:num_tokens]`` in place.
 
-    ``query`` and ``attn_output`` are the FIA operand/output slices with the
-    kv-major head layout ``(num_tokens, num_heads, head_dim)`` (a flat
-    ``(num_tokens, num_heads * head_dim)`` view works too); ``lse`` is the
-    TND softmax LSE, ``(num_tokens, num_heads[, 1])``. ``attn_output`` must
-    be contiguous (the FIA output buffer is) since the update is in place.
+    ``query`` and ``attn_output`` are the attention operand/output slices with
+    the kv-major head layout ``(num_tokens, num_heads, head_dim)`` (a flat
+    ``(num_tokens, num_heads * head_dim)`` view works too). ``lse`` is the
+    softmax LSE: token-major ``(num_tokens, num_heads[, 1])`` by default
+    (FIA), or head-major ``(num_heads, num_tokens)`` when ``lse_head_major``
+    is set (QFA). ``attn_output`` must be contiguous (the attention output
+    buffer is) since the update is in place.
     """
     if not query.is_contiguous():
         query = query.contiguous()
     assert attn_output.is_contiguous(), "in-place sink update needs a contiguous output"
     q2d = query.reshape(num_tokens * num_heads, head_dim)
     out2d = attn_output.reshape(num_tokens * num_heads, head_dim)
-    # LSE arrives as (T, H, 1) or (T, H); both flatten to one fp32 value per
-    # (token, head) pair. Reshape first (free for contiguous input), then
-    # materialize if a non-contiguous layout slips through.
+    # Flatten the LSE to one fp32 value per (token, head) pair. Token-major
+    # (T, H, 1)/(T, H) input is reshaped (and copied if it is not
+    # contiguous); QFA's head-major [H, T] input is already flat and
+    # contiguous, and the kernel indexes it directly with no transpose copy.
     if lse_head_major:
-        # QFA returns the LSE head-major, [num_heads, num_tokens]; the kernel
-        # indexes it directly, so no transpose copy is needed.
         lse2d = lse.reshape(-1)
         assert lse2d.is_contiguous(), "head-major LSE must be contiguous"
     else:

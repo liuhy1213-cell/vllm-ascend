@@ -477,8 +477,8 @@ class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
 
 # Standard A8C8 MXFP8 mode (FP32 softmax). Sliding-window layers use it too:
 # the mask-mode/quant-mode checker restriction is lifted by the patched
-# ops-transformer (cann/ops-transformer PR #16121), so no FP16-softmax
-# fallback is needed.
+# ops-transformer (cann/ops-transformer PR #16121), so no separate
+# FP16-softmax mode is required.
 QFA_QUANT_MODE_MXFP8 = 1
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
@@ -1077,9 +1077,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # <q, k-mu> = <q,k> - <q,mu>, and the second term depends only on the
         # query, so the softmax is unchanged. sink_key subtracts the same mu,
         # otherwise the sink column keeps its old weight against the keys.
-        # PR#13 moved the sink fold into _run_qfa (sink_key passed to QFA);
-        # the old torch-side sink_logits block and the C8_DISABLE_SINK A/B
-        # switch are both superseded.
+        # vllm-ascend PR #13 moved the sink fold into _run_qfa (sink_key is
+        # passed to QFA); the old torch-side sink_logits block and the
+        # C8_DISABLE_SINK A/B switch are both superseded.
         kv_center, sink_key = self._apply_kv_center(layer, query, sink_key)
 
         record_attention_compute_start()

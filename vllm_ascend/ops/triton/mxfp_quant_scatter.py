@@ -33,7 +33,7 @@ def _quant_scatter_kernel(
     v_ptr,  # fp8 PA_NZ [Bn, N, D // 32, Bs, 32]
     ks_ptr,  # e8m0 [Bn, N, Bs // 16, D // 64, 16, 2]
     num_pairs,
-    NUM_HEADS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,  # KV heads (input rows are [T, KV, D])
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     K_PAGE_STRIDE: tl.constexpr,
@@ -70,7 +70,7 @@ def _quant_scatter_kernel(
                     + (off % 16) * KS_FRAG_STRIDE
                 )
 
-                # K: four 32-element MX groups over the head dimension.
+                # K: one 32-element MX group per iteration over the head dimension.
                 for g in tl.static_range(HEAD_DIM // 32):
                     x = tl.load(key_ptr + row + g * 32 + d32).to(tl.float32)
                     amax = tl.max(tl.abs(x))

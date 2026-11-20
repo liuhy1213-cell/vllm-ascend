@@ -84,6 +84,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
     # Fuse K/V MXFP8 quantization and the PA_NZ packet scatter into one
     # Triton kernel for C8 layers. Default: 0 (disabled). Valid values: 0/1.
+    # This configuration is not sensitive.
     "VLLM_ASCEND_C8_FUSED_QUANT_SCATTER": lambda: _strict_binary_env("VLLM_ASCEND_C8_FUSED_QUANT_SCATTER"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
