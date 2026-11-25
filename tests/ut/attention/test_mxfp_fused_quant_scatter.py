@@ -31,8 +31,10 @@ class TestShouldFuseQuantScatter(TestBase):
 
     def test_enabled_but_prefill_sized_batch_falls_back(self):
         with _with(1):
+            # The wide-tile kernel removed the large-T dispatch penalty, so
+            # the gate now covers prefill chunk sizes up to 65536; only
+            # batches beyond the threshold fall back to the native chain.
             self.assertFalse(should_fuse_quant_scatter(FUSED_QUANT_SCATTER_MAX_TOKENS + 1))
-            self.assertFalse(should_fuse_quant_scatter(65536))
 
     def test_empty_batch_never_fuses(self):
         with _with(1):
