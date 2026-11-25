@@ -448,6 +448,7 @@ class AscendConfig:
             "iquest_qkv_agmm_comm_mode": "aiv_urma",
             "enable_iquest_triton_qk_norm": 0,
             "enable_iquest_split_qkv_rmsnorm_rope": 1,
+            "enable_c8_fused_quant_scatter": 0,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
@@ -639,6 +640,13 @@ class AscendConfig:
     # QK-norm kernel above. Enabled by default for iquest_q1; set 0 to fall
     # back to the unfused chain.
     enable_iquest_split_qkv_rmsnorm_rope: int = 1
+    # 1 = fuse the C8-MXFP decode-side KV cache write into one Triton kernel
+    # (ops/triton/mxfp_quant_scatter.py): K MX quantization + V static
+    # quantization + PA_NZ K/V packet scatter + K E8M0 scale scatter.
+    # Replaces four kernel launches per layer on decode-sized batches
+    # (num_actual_tokens <= 2048); prefill keeps the native path.
+    # Verified bit-exact against the native chain, including scale_alg=1.
+    enable_c8_fused_quant_scatter: int = 0
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
