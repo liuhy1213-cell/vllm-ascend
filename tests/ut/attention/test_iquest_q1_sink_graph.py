@@ -13,9 +13,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, FIAV2ParamProvider
-from vllm_ascend.models.iquest_q1.attention import (
+from vllm_ascend.attention.attention_v1 import (
     SWA_INT_MAX,
+    AscendAttentionBackend,
+    AscendAttentionState,
+    FIAV2ParamProvider,
+)
+from vllm_ascend.models.iquest_q1.attention import (
     IQuestQ1AscendAttentionBackend,
     IQuestQ1AscendAttentionImpl,
 )
@@ -25,6 +29,11 @@ NUM_KV_HEADS = 2
 HEAD_SIZE = 8
 SCALE = 0.25
 NUM_TOKENS = 4
+# The sink correction is a Triton kernel: it can only run on NPU tensors.
+# CPU tensors launch with host pointers and silently corrupt nothing (the
+# kernel is a no-op plus an async aivec error at sync), so pin everything to
+# the device when one is available.
+DEVICE = torch.device("npu") if torch.npu.is_available() else torch.device("cpu")
 ATTENTION_MODULE = "vllm_ascend.models.iquest_q1.attention"
 
 
@@ -36,12 +45,12 @@ def _make_impl(sliding_window=None):
     impl.scale = SCALE
     impl.attn_type = "DECODER"
     impl.use_bnsd_kv_cache = False
-    impl.key_cache = torch.randn(4, 16, NUM_KV_HEADS, HEAD_SIZE)
-    impl.value_cache = torch.randn(4, 16, NUM_KV_HEADS, HEAD_SIZE)
+    impl.key_cache = torch.randn(4, 16, NUM_KV_HEADS, HEAD_SIZE, device=DEVICE)
+    impl.value_cache = torch.randn(4, 16, NUM_KV_HEADS, HEAD_SIZE, device=DEVICE)
     impl.sliding_window = sliding_window
     impl._use_max_workspace_for_fia_graph = False
     impl._layer_name = "model.layers.0.self_attn.attn"
-    impl._sink_key = torch.randn(NUM_KV_HEADS, HEAD_SIZE)
+    impl._sink_key = torch.randn(NUM_KV_HEADS, HEAD_SIZE, device=DEVICE)
     return impl
 
 
@@ -74,8 +83,8 @@ def recorded_task():
     captured correction ops run, so the fake fills them with known values.
     """
     recorded = {}
-    raw_output = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE)
-    lse = torch.randn(NUM_TOKENS, NUM_HEADS, 1) * 3.0
+    raw_output = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, device=DEVICE)
+    lse = torch.randn(NUM_TOKENS, NUM_HEADS, 1, device=DEVICE) * 3.0
 
     def fake_register_task(operation, kwargs, provider):
         recorded["operation"] = operation
@@ -94,16 +103,16 @@ def recorded_task():
     return recorded, raw_output, lse, fake_register_task, fake_get_capture_resource
 
 
-@pytest.mark.parametrize("sliding_window,expected_sparse,expected_pre", [(None, 3, SWA_INT_MAX), (4096, 4, 4096)])
+@pytest.mark.parametrize("sliding_window,expected_sparse,expected_pre", [(None, 3, SWA_INT_MAX), (4096, 4, 4095)])
 def test_capture_registers_fia_task_and_applies_sink(recorded_task, sliding_window, expected_sparse, expected_pre):
     recorded, raw_output, lse, fake_register_task, fake_get_capture_resource = recorded_task
     impl = _make_impl(sliding_window=sliding_window)
     metadata = _make_metadata()
-    query = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE)
-    key = torch.randn(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE)
-    value = torch.randn(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE)
+    query = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, device=DEVICE)
+    key = torch.randn(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE, device=DEVICE)
+    value = torch.randn(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE, device=DEVICE)
     kv_cache = (impl.key_cache, impl.value_cache)
-    output = torch.full((NUM_TOKENS, NUM_HEADS, HEAD_SIZE), 7.0)
+    output = torch.full((NUM_TOKENS, NUM_HEADS, HEAD_SIZE), 7.0, device=DEVICE)
 
     with (
         patch(f"{ATTENTION_MODULE}.torch_npu") as mock_torch_npu,
@@ -141,7 +150,11 @@ def test_capture_registers_fia_task_and_applies_sink(recorded_task, sliding_wind
     assert recorded["use_max_workspace"] is False
 
     expected = _expected_output(query, impl._sink_key, raw_output, lse)
-    torch.testing.assert_close(output, expected.to(output.dtype), rtol=1e-5, atol=1e-6)
+    # The Triton kernel (EXACT_FP32=False) reproduces the BF16 torch path's
+    # intermediate roundings, while this reference is pure fp32: the deltas
+    # are bf16-quantum level (~2^-8 relative), so compare with the standard
+    # bf16 hybrid tolerance (2^-6) instead of fp32-grade rtol.
+    torch.testing.assert_close(output, expected.to(output.dtype), rtol=1.56e-2, atol=1.56e-2)
 
 
 def test_capture_uses_kv_cache_view_for_decode(recorded_task):
@@ -149,8 +162,8 @@ def test_capture_uses_kv_cache_view_for_decode(recorded_task):
     recorded, *_, fake_register_task, fake_get_capture_resource = recorded_task
     impl = _make_impl()
     metadata = _make_metadata()
-    query = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE)
-    output = torch.zeros(NUM_TOKENS, NUM_HEADS, HEAD_SIZE)
+    query = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, device=DEVICE)
+    output = torch.zeros(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, device=DEVICE)
 
     with (
         patch(f"{ATTENTION_MODULE}.torch_npu") as _,

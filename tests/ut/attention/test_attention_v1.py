@@ -15,6 +15,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
     AscendMetadata,
+    fia_pre_tokens,
 )
 from vllm_ascend.attention.context_parallel.attention_cp import (
     AscendAttentionDCPImpl,
@@ -539,6 +540,15 @@ class TestAscendAttentionBackendImpl(TestBase):
             kv_sharing_target_layer_name="producer_layer",
         )
 
+    def test_fia_pre_tokens_keeps_the_window_inclusive(self):
+        # FIA's left bound is inclusive (kv_idx >= q_idx + kv_len - q_len -
+        # pre_tokens), and the model window includes the query itself, so a
+        # 4096-token window looks 4095 tokens back. None/0 disable it.
+        self.assertEqual(fia_pre_tokens(4096), 4095)
+        self.assertEqual(fia_pre_tokens(1), 0)
+        self.assertEqual(fia_pre_tokens(None), attn_module.SWA_INT_MAX)
+        self.assertEqual(fia_pre_tokens(0), attn_module.SWA_INT_MAX)
+
     def test_kv_cache_dtype_honors_layer_override(self):
         self.mock_vllm_config.cache_config.cache_dtype = "fp8"
         self.mock_vllm_config.model_config.dtype = torch.bfloat16
@@ -930,6 +940,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         output = self.impl_swa.forward(layer, query, key, value, kv_cache, metadata, output)
         print(output.shape)
         mock_fused_infer_attention_score.assert_called_once()
+        assert mock_fused_infer_attention_score.call_args.kwargs["pre_tokens"] == 1023
         assert output.shape == (10, 8, 64)
 
     @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")
@@ -964,6 +975,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_fused_infer_attention_score_v2.return_value = (torch.ones(10, 8, 64), 1)
         output = self.impl_swa_sink.forward(layer, query, key, value, kv_cache, metadata, output)
         mock_fused_infer_attention_score_v2.assert_called_once()
+        assert mock_fused_infer_attention_score_v2.call_args.kwargs["pre_tokens"] == 1023
         mock_reshape_and_cache.assert_called_once()
         assert output.shape == (10, 8, 64)
 
