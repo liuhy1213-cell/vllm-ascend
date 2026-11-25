@@ -32,6 +32,8 @@ import os as _os
 from collections.abc import Iterable
 from itertools import islice
 
+import os as _os
+
 import torch
 import torch_npu
 from torch import nn
@@ -54,6 +56,10 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_reduce_scatter,
+)
 from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -88,6 +94,20 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+
+# [L6 perf] o_proj TP AllReduce -> ReduceScatter, 1 = enable. Requires TP>1.
+# POC 组合：o_proj 输出 reduce_results=False，然后 sp_reduce_scatter 收 1/8 行、
+# sp_all_gather 还原全量。总搬运量 ~1.25×T·H vs AR 的 2×T·H；下游 residual/norm/
+# MLP/MTP 保持全量行布局，零改动。T 非 TP 倍数时 RS pad 后 gather 裁剪。
+# 单算子实测（TP8, H=3072, bf16）：T=65536 1.54x、T=1536 1.17x、T=192 1.05x、T=6 0.69x。
+_IQUEST_OPROJ_RS = _os.getenv("IQUEST_OPROJ_RS", "0") == "1"
+
+
+def _use_tp_gt1() -> bool:
+    from vllm.config import get_current_vllm_config
+    cfg = get_current_vllm_config()
+    return bool(cfg and cfg.parallel_config.tensor_parallel_size > 1)
+
 
 logger = init_logger(__name__)
 
@@ -577,7 +597,12 @@ class IQuestQ1Attention(nn.Module):
             if self.rotary_emb and not self.use_split_qkv_rmsnorm_rope:
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        if _IQUEST_OPROJ_RS and _use_tp_gt1():
+            output, _ = self.o_proj(attn_output, reduce_results=False)
+            # T 非 TP 整数倍时 RS 会 pad 到倍数，gather 回来裁掉 padding 行
+            output = sp_all_gather(sp_reduce_scatter(output))[: attn_output.shape[0]]
+        else:
+            output, _ = self.o_proj(attn_output)
         return output
 
 
