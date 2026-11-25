@@ -102,12 +102,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import MoECommType, _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm_ascend.ops.fused_moe.routed_experts import moe_input_is_sharded
 from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
 from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
@@ -686,6 +688,11 @@ class IQuestQ1DecoderLayer(nn.Module):
         self.use_sandwich_norm = self.layer_idx == 0
         self.supports_fused_norm = True
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.use_moe_sequence_parallel = (
+            self.use_sequence_parallel
+            and vllm_config.model_config.enforce_eager
+            and use_cann_megamoe(vllm_config)
+        )
 
         mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
         if self.layer_idx not in mlp_only_layers:
@@ -733,6 +740,24 @@ class IQuestQ1DecoderLayer(nn.Module):
             self.attn_out_scale = getattr(config, "attn_out_scale", 1.0)
             self.ffn_out_scale = getattr(config, "ffn_out_scale", 1.0)
 
+    def _forward_ffn(
+        self, hidden_states: torch.Tensor, full_num_tokens: int, sp_active: bool
+    ) -> torch.Tensor:
+        if not sp_active:
+            return self.mlp(hidden_states)
+        if (
+            self.use_moe_sequence_parallel
+            and isinstance(self.mlp, IQuestQ1MoEBlock)
+            and _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
+        ):
+            layout = moe_input_is_sharded.set(True)
+            try:
+                return self.mlp(hidden_states)
+            finally:
+                moe_input_is_sharded.reset(layout)
+        full_input = sp_all_gather(hidden_states)[:full_num_tokens]
+        return sp_shard(self.mlp(full_input))
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -757,11 +782,7 @@ class IQuestQ1DecoderLayer(nn.Module):
 
             # fully connected
             _ffn_in = self.feed_forward_norm(h)
-            if sp:
-                _ffn_in = sp_all_gather(_ffn_in)[: positions.shape[0]]
-                hidden_states = sp_shard(self.mlp(_ffn_in))
-            else:
-                hidden_states = self.mlp(_ffn_in)
+            hidden_states = self._forward_ffn(_ffn_in, positions.shape[0], sp)
             output = h + self.ffn_out_norm(hidden_states) * self.ffn_out_scale
             return output
         else:
@@ -785,11 +806,7 @@ class IQuestQ1DecoderLayer(nn.Module):
                     self.feed_forward_norm.weight,
                     self.feed_forward_norm.variance_epsilon,
                 )
-                if sp:
-                    _ffn_in = sp_all_gather(ffn_in)[: positions.shape[0]]
-                    ffn_out = sp_shard(self.mlp(_ffn_in))
-                else:
-                    ffn_out = self.mlp(ffn_in)
+                ffn_out = self._forward_ffn(ffn_in, positions.shape[0], sp)
                 ffn_out = ffn_out * self.ffn_out_scale
                 if next_norm_weight is not None:
                     # Fold the next layer's attention_norm into this residual
@@ -815,11 +832,7 @@ class IQuestQ1DecoderLayer(nn.Module):
 
             # fully connected
             _ffn_in = self.feed_forward_norm(h)
-            if sp:
-                _ffn_in = sp_all_gather(_ffn_in)[: positions.shape[0]]
-                ffn_out = sp_shard(self.mlp(_ffn_in))
-            else:
-                ffn_out = self.mlp(_ffn_in)
+            ffn_out = self._forward_ffn(_ffn_in, positions.shape[0], sp)
             output = h + ffn_out * self.ffn_out_scale
             return output
 

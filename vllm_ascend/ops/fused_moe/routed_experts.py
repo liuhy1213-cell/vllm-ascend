@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 from collections.abc import Iterable
+from contextvars import ContextVar
 from copy import copy
 from types import SimpleNamespace
 
@@ -30,7 +31,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import Un
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import MoECommType, _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
@@ -47,6 +48,10 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+
+
+# The eager IQuest wrapper scopes the actual input layout to one MoE call.
+moe_input_is_sharded = ContextVar("moe_input_is_sharded", default=False)
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -714,13 +719,23 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if lora_context is not None:
             sync_lora_context(self.quant_method, lora_context)
 
+        input_is_sharded = moe_input_is_sharded.get()
+        if input_is_sharded and _EXTRA_CTX.moe_comm_type != MoECommType.FUSED_MC2:
+            raise RuntimeError("IQuest MoE shard requires the fused MC2 dispatcher")
         prepare_output = moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             # The SP model wrapper already shards and gathers the MoE sequence.
-            replace_allreduce=self.moe_config.is_sequence_parallel,
+            replace_allreduce=self.moe_config.is_sequence_parallel or input_is_sharded,
             quant_type=self.quant_type,
         )
+        if input_is_sharded and not getattr(self, "_logged_sharded_input", False):
+            self._logged_sharded_input = True
+            logger.warning_once(
+                "IQuest MegaMoe SP active: input=%d prepared=%d tokens per rank",
+                hidden_states.shape[0],
+                prepare_output.hidden_states.shape[0],
+            )
         hidden_states = prepare_output.hidden_states
         router_logits = prepare_output.router_logits
         mc2_mask = prepare_output.mc2_mask
