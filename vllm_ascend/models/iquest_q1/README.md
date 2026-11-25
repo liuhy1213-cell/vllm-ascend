@@ -1,0 +1,133 @@
+# IQuest-Q1 on Ascend NPU (v0)
+
+Ascend port of `IQuestLab/IQuest-Q1` (320B MoE, `model_type: iquest_q1`).
+Upstream vLLM does not ship this architecture.
+
+## Files
+
+| File | Origin |
+|---|---|
+| `configs.py` | Ported verbatim from the upstream plugin `IQuestLab/vllm-iquest-q1` |
+| `model.py` | Ported from the same plugin; only the attention layer was re-pointed |
+| `attention.py` | **New** — Ascend learned-key sink attention (replaces the plugin's CUDA FA backend) |
+| `reasoning_parser.py`, `tool_parser.py` | Ported verbatim from the same plugin (`--reasoning-parser iquest_q1` / `--tool-call-parser iquest_q1`) |
+| `__init__.py`, `README.md` | New |
+
+## How the sink works here
+
+IQuest-Q1 gives every layer a learned *sink key* `sink_k` of shape `(num_kv_heads, head_dim)`.
+It behaves as an always-visible, zero-valued KV entry, so it only rescales the
+softmax denominator:
+
+```
+sink_logit = scale * (q . sink_k[head // num_queries_per_kv])
+out        = out_raw * sigmoid(-(sink_logit - lse))
+```
+
+The CANN FIA operand `learnable_sink` cannot express this: it is a per-query-head
+**constant** bfloat16 tensor of shape `(Q_N,)` (the gpt-oss / DeepSeek-V4 style sink),
+whereas `q . sink_k` varies per token and per head. So instead we ask
+`torch_npu.npu_fused_infer_attention_score_v2(..., return_softmax_lse=True)` for the
+real softmax LSE — `softmax_max + log(softmax_sum)`, shape `(T, Q_N, 1)` for TND —
+and apply the correction with plain torch ops (see `_apply_sink_key`).
+
+No custom Ascend kernel is needed at this stage. A Triton-ascend fusion of
+`q·sink_k → exp → div` is the obvious next optimization.
+
+## ACL graph mode
+
+Decode supports ACL graph capture (`--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`,
+or `FULL`). The FIA v2 call is registered as an **updatable task**
+(`vllm_ascend/compilation/updatable_graph.py`): during capture the op is
+recorded inside a task group, and before every replay its host-side
+`actual_seq_qlen` / `actual_seq_kvlen` are re-resolved from the live attention
+metadata and the task node is refreshed (`graph_task_update`). The sink
+correction is captured as ordinary graph ops that read the task's output
+buffers (attention output + a fp32 `(T, Q_N, 1)` LSE buffer), so it re-runs on
+updated FIA results each replay.
+
+Two details that matter:
+- the `.out` variant only fills the LSE buffer when `return_softmax_lse=True`
+  is passed explicitly (verified on 950DT: without the flag the buffer keeps
+  stale contents);
+- the LSE returned by `return_softmax_lse=True` is **fp32**, not the query
+  dtype.
+
+Prefill runs eagerly under `FULL_DECODE_ONLY` (chunked-prefill phase split and
+context parallelism remain unsupported).
+
+## v0 scope / limitations
+
+- No quantization (bf16 only), no LoRA weights, no context parallelism.
+
+## Running
+
+```bash
+MODEL_ROOT=/path/to/IQuest-Q1
+
+vllm serve "$MODEL_ROOT" \
+  --served-model-name IQuest-Q1 \
+  --tensor-parallel-size 8 \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --reasoning-parser iquest_q1 \
+  --enable-auto-tool-choice \
+  --tool-call-parser iquest_q1 \
+  --max-model-len 8192        # start small; 512K needs real KV budget planning
+```
+
+Pass `--enforce-eager` to disable ACL graphs entirely (e.g., for debugging).
+
+### Recursive MTP speculative decoding (optional)
+
+The checkpoint ships a one-layer recursive draft as the `mtp/` subdirectory
+(`model_type: iquest_q1_mtp`, architecture `IQuestQ1MTP`). Add:
+
+```bash
+vllm serve "$MODEL_ROOT" ... \
+  --speculative-config '{"method":"eagle","model":"'"$MODEL_ROOT"'/mtp","num_speculative_tokens":5}'
+```
+
+- `num_speculative_tokens` must not exceed the checkpoint's trained
+  `num_draft_slots` (7); 5 is a validated depth. Serial drafting only
+  (`method='eagle'`; the target model rejects `method='mtp'`).
+- The draft reuses the target embedding and lm-head weights when they match,
+  so the extra memory is one draft layer plus its own KV cache group.
+- The draft runs the same Ascend sink-attention path and is wrapped in
+  `ACLGraphWrapper`, so speculative decoding works under the default
+  `FULL_DECODE_ONLY` graph mode too (verified on 950DT). Pass
+  `--enforce-eager` to disable ACL graphs entirely (e.g., for debugging).
+- ACL graph capture pools carve out device memory: at
+  `--gpu-memory-utilization 0.94` the KV budget shrinks to ~0.11 GiB
+  (~2.3k tokens) once the decode and draft graphs are captured. Raise the
+  utilization or lower `--max-num-seqs` when more concurrency is needed.
+- On Ascend the per-layer KV layout rescales the multi-group budget at
+  profiling time; prefer raising `--gpu-memory-utilization` over
+  `--kv-cache-memory` (the latter bypasses that rescaling and over-allocates).
+
+OpenAI-compatible smoke test:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"IQuest-Q1","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":16,"temperature":0}'
+```
+
+## Verification checklist (in order)
+
+1. **Loads at all** — config parsing, 175 shards, expert weight mapping.
+   Watch for: `IQuestQ1ForCausalLM` resolving; `sinks_k_weight_loader` sharding `sink_k` by TP.
+2. **FIA accepts `return_softmax_lse=True` here** — this is the single unverified
+   assumption (see the plan doc §4.3). Confirm it works for both
+   `sparse_mode=4` (the 63 sliding-window layers) and `sparse_mode=3` (the 25 full layers),
+   and for both prefill and paged decode.
+3. **Sink is actually applied** — construct a 1-token prompt and compare against a
+   run with `enable_sink_attention` forced off; the outputs must differ.
+4. **Token-level agreement** vs the GPU reference (SGLang image
+   `iquestlabworkspace/sglang-iquest-q1:cu130` or HF transformers 4.57.1) at
+   `temperature=0`.
+
+## Known risk areas
+
+- `"sink" in name` in `worker/model_runner_v1.py` flips `_has_sinks` and sets
+  `forward_context.sinks`. That flag is currently **not consumed** anywhere in
+  vllm-ascend, so it should be inert — but worth re-checking if attention misbehaves.
