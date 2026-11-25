@@ -38,6 +38,7 @@ from vllm.v1.attention.backend import (  # type: ignore
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -70,6 +71,22 @@ MXFP_KV_SCALE_GROUP_SIZE = 64
 MXFP_KV_SCALE_VALUES_PER_GROUP = 2
 MXFP_KV_NZ_DIM_FRAG = 32
 MXFP_K_SCALE_NZ_TOKEN_FRAG = 16
+
+# Decode-sized batches only: the fused Triton kernel wins on tiny batches but
+# its per-program dispatch loses to the native quantize/scatter tiling on large
+# prefill chunks (measured; TTFT matters), so keep the native path above it.
+FUSED_QUANT_SCATTER_MAX_TOKENS = 65536
+
+
+def should_fuse_quant_scatter(num_actual_tokens: int) -> bool:
+    """Whether to run the fused quant+scatter kernel for this batch.
+
+    Controlled by ``additional_config.enable_c8_fused_quant_scatter``; the
+    batch-size gate keeps large prefill chunks on the native tiling, which
+    wins there (measured).
+    """
+    enabled = bool(get_ascend_config().enable_c8_fused_quant_scatter)
+    return enabled and 0 < num_actual_tokens <= FUSED_QUANT_SCATTER_MAX_TOKENS
 
 MXFP_V_SCALE_NZ_DIM_FRAG = 16
 # Unified per-block scale bytes: num_kv_heads * block_size * head_dim / MXFP8_GROUP_SIZE (K and V).
@@ -1100,26 +1117,42 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                     key.reshape(-1, self.num_kv_heads, self.head_size) - kv_center
                 ).reshape_as(key)
 
-            key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                key_in[: attn_metadata.num_actual_tokens],
-                dst_type=torch.float8_e4m3fn,
-                scale_alg=1,
-            )
+            # One Triton launch replaces four kernels on decode-sized batches.
+            if should_fuse_quant_scatter(attn_metadata.num_actual_tokens):
+                from vllm_ascend.ops.triton.mxfp_quant_scatter import quant_scatter_mxfp8
 
-            original_value_shape = value.shape
-            value = value.view(original_value_shape[0], -1)
-            value_mxfp8 = torch_npu.npu_quantize(
-                value[: attn_metadata.num_actual_tokens],
-                layer.v_cache_scale_float_reciprocal,
-                None,
-                torch.float8_e4m3fn,
-                -1,
-                False,
-            )
-            value_mxfp8 = value_mxfp8.view(
-                (attn_metadata.num_actual_tokens, *original_value_shape[1:]))
+                num_fused = attn_metadata.num_actual_tokens
+                quant_scatter_mxfp8(
+                    key_in[:num_fused].reshape(num_fused, self.num_kv_heads, self.head_size),
+                    value[:num_fused].reshape(num_fused, self.num_kv_heads, self.head_size),
+                    layer.v_cache_scale_float_reciprocal,
+                    kv_cache[0],
+                    kv_cache[1],
+                    kv_cache[2],
+                    attn_metadata.slot_mapping[:num_fused],
+                )
+                notify_kv_cache_written()
+            else:
+                key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
+                    key_in[: attn_metadata.num_actual_tokens],
+                    dst_type=torch.float8_e4m3fn,
+                    scale_alg=1,
+                )
 
-            self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
+                original_value_shape = value.shape
+                value = value.view(original_value_shape[0], -1)
+                value_mxfp8 = torch_npu.npu_quantize(
+                    value[: attn_metadata.num_actual_tokens],
+                    layer.v_cache_scale_float_reciprocal,
+                    None,
+                    torch.float8_e4m3fn,
+                    -1,
+                    False,
+                )
+                value_mxfp8 = value_mxfp8.view(
+                    (attn_metadata.num_actual_tokens, *original_value_shape[1:]))
+
+                self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
