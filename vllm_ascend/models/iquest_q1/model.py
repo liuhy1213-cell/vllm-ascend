@@ -146,15 +146,6 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
-# [L6 perf] o_proj TP AllReduce -> ReduceScatter, 1 = enable. Requires TP>1.
-# POC 组合：o_proj 输出 reduce_results=False，然后 sp_reduce_scatter 收 1/8 行、
-# sp_all_gather 还原全量。总搬运量 ~1.25×T·H vs AR 的 2×T·H；下游 residual/norm/
-# MLP/MTP 保持全量行布局，零改动。T 非 TP 倍数时 RS pad 后 gather 裁剪。
-# 单算子实测（TP8, H=3072, bf16）：T=65536 1.54x、T=1536 1.17x、T=192 1.05x、T=6 0.69x。
-_IQUEST_OPROJ_RS = _os.getenv("IQUEST_OPROJ_RS", "0") == "1"
-
-
-
 logger = init_logger(__name__)
 
 
@@ -416,14 +407,13 @@ class IQuestQ1Attention(nn.Module):
         self.use_sequence_parallel = (
             _use_sequence_parallel(vllm_config) and not is_mtp_layer
         )
-        self.use_o_proj_rs = _IQUEST_OPROJ_RS and self.tp_size > 1
         self.q_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=not (self.use_sequence_parallel or self.use_o_proj_rs),
+            reduce_results=not self.use_sequence_parallel,
             prefix=f"{prefix}.o_proj",
         )
         # [L3 perf] Optional fused o_proj GEMM + TP AllReduce (npu_mm_all_reduce_base),
@@ -658,9 +648,6 @@ class IQuestQ1Attention(nn.Module):
         if sp:
             # Keep this rank's token shard in the residual stream.
             output = sp_reduce_scatter(output)
-        elif self.use_o_proj_rs:
-            # The optional RS+AG path restores the full-token layout.
-            output = sp_all_gather(sp_reduce_scatter(output))[: output.shape[0]]
         elif self.use_sequence_parallel:
             # Non-SP forwards still need the TP sum of the row-parallel partials.
             output = tensor_model_parallel_all_reduce(output)
