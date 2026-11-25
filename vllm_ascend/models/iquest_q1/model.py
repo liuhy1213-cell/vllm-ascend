@@ -42,6 +42,53 @@ from torch import nn
 # Inductor AddRMSNorm/norm-quant passes never fire there. Default off.
 _FUSE_NORM_CHAIN = _os.getenv("IQUEST_FUSE_NORM", "1") == "1"
 
+# Phase-2 sequence parallelism follows the Ascend FlashComm switch
+# (additional_config.enable_flashcomm1), the same switch the framework SP
+# path uses. It also needs the patched use_sequence_parallel_moe flag
+# (TP>1 + EP) so the framework topology agrees with this layout.
+def _flashcomm_enabled(vllm_config) -> bool:
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    switch = additional.get("enable_flashcomm1", False)
+    if isinstance(switch, str):
+        return switch.strip().lower() in ("1", "true")
+    if bool(switch):
+        return True
+    return _os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower() in ("1", "true")
+
+
+def _use_sequence_parallel(vllm_config) -> bool:
+    """Whether this model is capable of sequence parallelism.
+
+    The actual layout is chosen per forward (``_is_prefill_forward``) so MTP
+    decode and mixed batches keep the full-token all-reduce path.
+    """
+    parallel = vllm_config.parallel_config
+    if parallel.tensor_parallel_size <= 1:
+        return False
+    if not getattr(parallel, "use_sequence_parallel_moe", False):
+        return False
+    return _flashcomm_enabled(vllm_config)
+
+
+def _is_prefill_forward() -> bool:
+    """True only for a pure-prefill batch.
+
+    Decode steps and mixed prefill+decode batches keep the non-SP layout: the
+    MTP draft and the decode path are not sequence-parallel today.
+    """
+    try:
+        from vllm.forward_context import get_forward_context
+
+        ctx = get_forward_context()
+    except Exception:
+        return False
+    md = getattr(ctx, "attn_metadata", None)
+    if isinstance(md, dict):
+        md = next((m for m in md.values() if hasattr(m, "num_prefills")), None)
+    if md is None:
+        return False
+    return getattr(md, "num_prefills", 0) > 0 and getattr(md, "num_decodes", 0) == 0
+
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.model import str_dtype_to_torch_dtype
@@ -49,17 +96,19 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
+    sp_shard,
 )
+from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
 from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -102,11 +151,6 @@ from vllm.v1.attention.backend import AttentionType
 # 单算子实测（TP8, H=3072, bf16）：T=65536 1.54x、T=1536 1.17x、T=192 1.05x、T=6 0.69x。
 _IQUEST_OPROJ_RS = _os.getenv("IQUEST_OPROJ_RS", "0") == "1"
 
-
-def _use_tp_gt1() -> bool:
-    from vllm.config import get_current_vllm_config
-    cfg = get_current_vllm_config()
-    return bool(cfg and cfg.parallel_config.tensor_parallel_size > 1)
 
 
 logger = init_logger(__name__)
@@ -197,6 +241,7 @@ class IQuestQ1MoEBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
         router_dtype: torch.dtype = torch.float32,
         tp_size: int | None = None,
+        is_sequence_parallel: bool = False,
         prefix: str = "",
     ):
         super().__init__()
@@ -226,6 +271,7 @@ class IQuestQ1MoEBlock(nn.Module):
             router_logits_dtype=router_dtype,
             quant_config=quant_config,
             tp_size=tp_size,
+            is_sequence_parallel=is_sequence_parallel,
             prefix=f"{prefix}.experts",
         )
 
@@ -363,18 +409,25 @@ class IQuestQ1Attention(nn.Module):
         )
         self.tp_size = tp_size
         self.tp_rank = get_tensor_model_parallel_rank()
+        # The MTP draft runs on full tokens (its recursive block is not
+        # sequence-parallel), so keep its attention on the all-reduce path.
+        self.use_sequence_parallel = (
+            _use_sequence_parallel(vllm_config) and not is_mtp_layer
+        )
+        self.use_o_proj_rs = _IQUEST_OPROJ_RS and self.tp_size > 1
         self.q_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not (self.use_sequence_parallel or self.use_o_proj_rs),
             prefix=f"{prefix}.o_proj",
         )
         # [L3 perf] Optional fused o_proj GEMM + TP AllReduce (npu_mm_all_reduce_base),
         # gated by additional_config "enable_fused_o_proj_ar". Unsupported configs
         # (scheme/TP/weights) are logged once and keep the unfused path.
-        if get_ascend_config().enable_fused_o_proj_ar:
+        if self.o_proj.reduce_results and get_ascend_config().enable_fused_o_proj_ar:
             if (reason := OProjMMAllReduceOp.unsupported_reason(self.o_proj)) is None:
                 self.o_proj.custom_op = OProjMMAllReduceOp(self.o_proj)
             else:
@@ -533,6 +586,7 @@ class IQuestQ1Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        sp_active: bool | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_split_qkv_rmsnorm_rope:
@@ -597,12 +651,17 @@ class IQuestQ1Attention(nn.Module):
             if self.rotary_emb and not self.use_split_qkv_rmsnorm_rope:
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
-        if _IQUEST_OPROJ_RS and _use_tp_gt1():
-            output, _ = self.o_proj(attn_output, reduce_results=False)
-            # T 非 TP 整数倍时 RS 会 pad 到倍数，gather 回来裁掉 padding 行
-            output = sp_all_gather(sp_reduce_scatter(output))[: attn_output.shape[0]]
-        else:
-            output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
+        sp = self.use_sequence_parallel and (sp_active is None or sp_active)
+        if sp:
+            # Keep this rank's token shard in the residual stream.
+            output = sp_reduce_scatter(output)
+        elif self.use_o_proj_rs:
+            # The optional RS+AG path restores the full-token layout.
+            output = sp_all_gather(sp_reduce_scatter(output))[: output.shape[0]]
+        elif self.use_sequence_parallel:
+            # Non-SP forwards still need the TP sum of the row-parallel partials.
+            output = tensor_model_parallel_all_reduce(output)
         return output
 
 
@@ -626,6 +685,7 @@ class IQuestQ1DecoderLayer(nn.Module):
         )
         self.use_sandwich_norm = self.layer_idx == 0
         self.supports_fused_norm = True
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
         if self.layer_idx not in mlp_only_layers:
@@ -636,6 +696,11 @@ class IQuestQ1DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
                 router_dtype=str_dtype_to_torch_dtype(config.moe_router_dtype),
+                # Keep the MoE on full tokens: the CUDA MoE sequence-parallel
+                # (replace_allreduce) path currently returns wrong values for
+                # this DP=1 TP/EP topology, so the layer gathers before the
+                # MoE and shards its output instead.
+                is_sequence_parallel=False,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -674,23 +739,42 @@ class IQuestQ1DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         pre_normed: bool = False,
         next_norm_weight: torch.Tensor | None = None,
+        sp_active: bool | None = None,
     ) -> torch.Tensor:
+        sp = self.use_sequence_parallel if sp_active is None else sp_active
         # Self Attention
         if self.use_sandwich_norm:
             norm_hidden_states = self.attention_norm(hidden_states)
+            attn_input = (
+                sp_all_gather(norm_hidden_states)[: positions.shape[0]]
+                if sp
+                else norm_hidden_states
+            )
             attn_output = self.self_attn(
-                positions=positions, hidden_states=norm_hidden_states
+                positions=positions, hidden_states=attn_input, sp_active=sp
             )
             h = hidden_states + self.attn_out_norm(attn_output) * self.attn_out_scale
 
             # fully connected
-            hidden_states = self.mlp(self.feed_forward_norm(h))
+            _ffn_in = self.feed_forward_norm(h)
+            if sp:
+                _ffn_in = sp_all_gather(_ffn_in)[: positions.shape[0]]
+                hidden_states = sp_shard(self.mlp(_ffn_in))
+            else:
+                hidden_states = self.mlp(_ffn_in)
             output = h + self.ffn_out_norm(hidden_states) * self.ffn_out_scale
             return output
         else:
             if _FUSE_NORM_CHAIN:
                 x = hidden_states if pre_normed else self.attention_norm(hidden_states)
-                attn_output = self.self_attn(positions=positions, hidden_states=x)
+                attn_input = (
+                    sp_all_gather(x)[: positions.shape[0]]
+                    if sp
+                    else x
+                )
+                attn_output = self.self_attn(
+                    positions=positions, hidden_states=attn_input, sp_active=sp
+                )
                 branch = self.attn_out_norm(attn_output)
                 if self.attn_out_scale != 1.0:
                     branch = branch * self.attn_out_scale
@@ -701,7 +785,12 @@ class IQuestQ1DecoderLayer(nn.Module):
                     self.feed_forward_norm.weight,
                     self.feed_forward_norm.variance_epsilon,
                 )
-                ffn_out = self.mlp(ffn_in) * self.ffn_out_scale
+                if sp:
+                    _ffn_in = sp_all_gather(ffn_in)[: positions.shape[0]]
+                    ffn_out = sp_shard(self.mlp(_ffn_in))
+                else:
+                    ffn_out = self.mlp(ffn_in)
+                ffn_out = ffn_out * self.ffn_out_scale
                 if next_norm_weight is not None:
                     # Fold the next layer's attention_norm into this residual
                     # add; only the normalized value is needed downstream.
@@ -714,11 +803,23 @@ class IQuestQ1DecoderLayer(nn.Module):
                 return h + ffn_out
 
             x = self.attention_norm(hidden_states)
-            attn_output = self.self_attn(positions=positions, hidden_states=x)
+            attn_input = (
+                sp_all_gather(x)[: positions.shape[0]]
+                if sp
+                else x
+            )
+            attn_output = self.self_attn(
+                positions=positions, hidden_states=attn_input, sp_active=sp
+            )
             h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
 
             # fully connected
-            ffn_out = self.mlp(self.feed_forward_norm(h))
+            _ffn_in = self.feed_forward_norm(h)
+            if sp:
+                _ffn_in = sp_all_gather(_ffn_in)[: positions.shape[0]]
+                ffn_out = sp_shard(self.mlp(_ffn_in))
+            else:
+                ffn_out = self.mlp(_ffn_in)
             output = h + ffn_out * self.ffn_out_scale
             return output
 
@@ -767,6 +868,7 @@ class IQuestQ1Model(nn.Module):
                 "IQuestQ1 over-encoding embeddings are not supported"
             )
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, oe_input_ids: torch.Tensor | None = None
@@ -793,6 +895,14 @@ class IQuestQ1Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        full_num_tokens = positions.shape[0]
+        # Per-forward layout: pure prefill uses the token-sharded SP path,
+        # decode/MTP and mixed batches keep the full-token all-reduce path.
+        sp_active = self.use_sequence_parallel and _is_prefill_forward()
+        if sp_active:
+            # Keep the residual stream token-sharded through the decoder stack.
+            hidden_states = sp_shard(hidden_states)
+
         layers = list(islice(self.layers, self.start_layer, self.end_layer))
         for idx, layer in enumerate(layers):
             if _FUSE_NORM_CHAIN and getattr(layer, "supports_fused_norm", False):
@@ -812,16 +922,22 @@ class IQuestQ1Model(nn.Module):
                     hidden_states,
                     pre_normed=prev_fused,
                     next_norm_weight=nxt,
+                    sp_active=sp_active,
                 )
             else:
                 hidden_states = layer(
                     positions,
                     hidden_states,
+                    sp_active=sp_active,
                 )
 
         if not get_pp_group().is_last_rank:
+            if sp_active:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
             return IntermediateTensors({"hidden_states": hidden_states})
 
+        if sp_active:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
