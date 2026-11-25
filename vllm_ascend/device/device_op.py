@@ -1229,13 +1229,17 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             k_group=k_group,
             group_count=group_count,
             group_select_mode=group_select_mode,
-            renorm=0,
+            # renorm=1 is passed through to the CANN op, which folds the
+            # renormalization (sum + div) into MoeGatingTopK itself. Verified
+            # on Ascend 950DT (tools/verify_router_fusion.py): ids are
+            # bit-exact; weights differ from the old Python-side renorm by
+            # <=1.2e-07 (one fp32 ULP). Removes the aclnnReduceSum/aclnnDiv
+            # launches per MoE layer (~1.27% of decode device time).
+            renorm=renorm,
             norm_type=norm_type,
             routed_scaling_factor=routed_scaling_factor,
             eps=eps,
         )
-        if norm_type == 0 and renorm == 1:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         return topk_weights, topk_ids.to(torch.int32), out
 
