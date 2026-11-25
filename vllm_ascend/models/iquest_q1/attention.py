@@ -47,12 +47,12 @@ from vllm.model_executor.layers.attention import Attention
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     _FIA_V2_WORKSPACE_KEY,
-    SWA_INT_MAX,
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
     FIAV2ParamProvider,
+    fia_pre_tokens,
 )
 from vllm_ascend.compilation.updatable_graph import get_capture_resource, register_task
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
@@ -150,7 +150,7 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
             num_query_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
             input_layout="TND",
-            pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+            pre_tokens=fia_pre_tokens(self.sliding_window),
             next_tokens=0,
             atten_mask=attn_metadata.attn_mask,
             sparse_mode=sparse_mode,
@@ -221,7 +221,7 @@ class IQuestQ1AscendAttentionImpl(AscendAttentionBackendImpl):
             "num_key_value_heads": self.num_kv_heads,
             "num_query_heads": self.num_heads,
             "sparse_mode": 4 if has_sliding_window else 3,
-            "pre_tokens": self.sliding_window if has_sliding_window else SWA_INT_MAX,
+            "pre_tokens": fia_pre_tokens(self.sliding_window),
             "next_tokens": 0,
             "softmax_scale": self.scale,
             # The .out variant only fills the LSE buffer when this is set.

@@ -68,6 +68,26 @@ from vllm_ascend.utils import MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE, is_minimax_m3_
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+
+
+def fia_pre_tokens(sliding_window: int | None) -> int:
+    """Return FIA's ``pre_tokens`` for a model sliding window.
+
+    FIA counts the KV positions to the left of the query row, and the left
+    bound it computes (``q_idx + kv_len - q_len - pre_tokens``) is inclusive.
+    The model's window is inclusive of the query itself (HF:
+    ``kv_idx > q_idx - sliding_window``; FlashAttention stores
+    ``(sliding_window - 1, 0)``), so ``sliding_window`` tokens become
+    ``sliding_window - 1`` previous tokens. Passing ``sliding_window``
+    directly would let every query see one extra token.
+
+    ``None`` (and the degenerate ``0``) disable the window.
+    """
+    if not sliding_window:
+        return SWA_INT_MAX
+    return sliding_window - 1
+
+
 _FIA_WORKSPACE_KEY = "npu_fused_infer_attention_score.workspace"
 _FIA_V2_WORKSPACE_KEY = "npu_fused_infer_attention_score_v2.workspace"
 _PA_WORKSPACE_KEY = "npu_paged_attention.workspace"
@@ -654,7 +674,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         input_layout = "TND"
         attn_mask = attn_metadata.attn_mask
         sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
-        pre_tokens = self.sliding_window or SWA_INT_MAX
+        pre_tokens = fia_pre_tokens(self.sliding_window)
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
         output_view = output[: attn_metadata.num_actual_tokens]
 
@@ -773,7 +793,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 num_query_heads=self.num_heads,
                 sparse_mode=4 if self.sliding_window is not None else 3,
-                pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+                pre_tokens=fia_pre_tokens(self.sliding_window),
                 next_tokens=0,
                 learnable_sink=self.sinks,
             ),
@@ -794,7 +814,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "num_key_value_heads": self.num_kv_heads,
                 "num_query_heads": self.num_heads,
                 "sparse_mode": 4 if self.sliding_window is not None else 3,
-                "pre_tokens": self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+                "pre_tokens": fia_pre_tokens(self.sliding_window),
                 "next_tokens": 0,
                 "softmax_scale": self.scale,
                 "learnable_sink": self.sinks,
@@ -948,7 +968,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_query_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 input_layout="TND",
-                pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+                pre_tokens=fia_pre_tokens(self.sliding_window),
                 next_tokens=0,
                 atten_mask=attn_metadata.attn_mask,
                 sparse_mode=sparse_mode,
@@ -989,7 +1009,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
                     scale=self.scale,
-                    pre_tokens=self.sliding_window,
+                    pre_tokens=fia_pre_tokens(self.sliding_window),
                     next_tokens=0,
                     sparse_mode=4,
                 )

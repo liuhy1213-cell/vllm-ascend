@@ -863,11 +863,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # and the one used by the official GPU implementation
         # (vLLM FlashAttentionImpl stores ``(sliding_window - 1, 0)`` and
         # FlashAttention's window_size is inclusive on both ends).
-        # NOTE: the BF16 FIA path in this repo passes
-        # ``pre_tokens = sliding_window`` (i.e. one extra token). That is a
-        # pre-existing Ascend-side discrepancy (present since the first
-        # sliding-window support, 2025-08); this backend intentionally matches
-        # the model definition instead of copying it.
+        # The BF16 FIA path maps the same window through ``fia_pre_tokens``
+        # (``pre_tokens = sliding_window - 1``; FIA's left bound is
+        # inclusive), so both backends cover the same 4096 tokens.
         # The mask stays attached because QFA requires attn_mask for every
         # non-NO_MASK mode.
         if self.sliding_window is not None:
