@@ -38,10 +38,6 @@ import torch
 import torch_npu
 from torch import nn
 
-# Phase-1 eager norm-chain fusion. P nodes run --enforce-eager, so the
-# Inductor AddRMSNorm/norm-quant passes never fire there. Default off.
-_FUSE_NORM_CHAIN = _os.getenv("IQUEST_FUSE_NORM", "1") == "1"
-
 # Phase-2 sequence parallelism follows the Ascend FlashComm switch
 # (additional_config.enable_flashcomm1), the same switch the framework SP
 # path uses. It also needs the patched use_sequence_parallel_moe flag
@@ -96,7 +92,6 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -106,7 +101,6 @@ from vllm_ascend.ascend_forward_context import MoECommType, _EXTRA_CTX, use_cann
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_reduce_scatter,
     sp_shard,
 )
 from vllm_ascend.ops.fused_moe.routed_experts import moe_input_is_sharded
@@ -413,7 +407,6 @@ class IQuestQ1Attention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=not self.use_sequence_parallel,
             prefix=f"{prefix}.o_proj",
         )
         # [L3 perf] Optional fused o_proj GEMM + TP AllReduce (npu_mm_all_reduce_base),
@@ -645,13 +638,9 @@ class IQuestQ1Attention(nn.Module):
             attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         sp = self.use_sequence_parallel and (sp_active is None or sp_active)
-        if sp:
-            # Keep this rank's token shard in the residual stream.
-            output = sp_reduce_scatter(output)
-        elif self.use_sequence_parallel:
-            # Non-SP forwards still need the TP sum of the row-parallel partials.
-            output = tensor_model_parallel_all_reduce(output)
-        return output
+        # Shard only after the original TP reduction. A BF16 ReduceScatter
+        # can accumulate in a different order and change end-to-end logits.
+        return sp_shard(output) if sp else output
 
 
 class IQuestQ1DecoderLayer(nn.Module):
@@ -673,7 +662,6 @@ class IQuestQ1DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         self.use_sandwich_norm = self.layer_idx == 0
-        self.supports_fused_norm = True
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.use_moe_sequence_parallel = (
             self.use_sequence_parallel
@@ -749,8 +737,6 @@ class IQuestQ1DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        pre_normed: bool = False,
-        next_norm_weight: torch.Tensor | None = None,
         sp_active: bool | None = None,
     ) -> torch.Tensor:
         sp = self.use_sequence_parallel if sp_active is None else sp_active
@@ -772,56 +758,22 @@ class IQuestQ1DecoderLayer(nn.Module):
             hidden_states = self._forward_ffn(_ffn_in, positions.shape[0], sp)
             output = h + self.ffn_out_norm(hidden_states) * self.ffn_out_scale
             return output
-        else:
-            if _FUSE_NORM_CHAIN:
-                x = hidden_states if pre_normed else self.attention_norm(hidden_states)
-                attn_input = (
-                    sp_all_gather(x)[: positions.shape[0]]
-                    if sp
-                    else x
-                )
-                attn_output = self.self_attn(
-                    positions=positions, hidden_states=attn_input, sp_active=sp
-                )
-                branch = self.attn_out_norm(attn_output)
-                if self.attn_out_scale != 1.0:
-                    branch = branch * self.attn_out_scale
-                # h = x + branch and ffn_in = RMSNorm(h) in one kernel.
-                ffn_in, _, h = torch_npu.npu_add_rms_norm(
-                    x,
-                    branch,
-                    self.feed_forward_norm.weight,
-                    self.feed_forward_norm.variance_epsilon,
-                )
-                ffn_out = self._forward_ffn(ffn_in, positions.shape[0], sp)
-                ffn_out = ffn_out * self.ffn_out_scale
-                if next_norm_weight is not None:
-                    # Fold the next layer's attention_norm into this residual
-                    # add; only the normalized value is needed downstream.
-                    return torch_npu.npu_add_rms_norm(
-                        h,
-                        ffn_out,
-                        next_norm_weight,
-                        self.feed_forward_norm.variance_epsilon,
-                    )[0]
-                return h + ffn_out
+        x = self.attention_norm(hidden_states)
+        attn_input = (
+            sp_all_gather(x)[: positions.shape[0]]
+            if sp
+            else x
+        )
+        attn_output = self.self_attn(
+            positions=positions, hidden_states=attn_input, sp_active=sp
+        )
+        h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
 
-            x = self.attention_norm(hidden_states)
-            attn_input = (
-                sp_all_gather(x)[: positions.shape[0]]
-                if sp
-                else x
-            )
-            attn_output = self.self_attn(
-                positions=positions, hidden_states=attn_input, sp_active=sp
-            )
-            h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
-
-            # fully connected
-            _ffn_in = self.feed_forward_norm(h)
-            ffn_out = self._forward_ffn(_ffn_in, positions.shape[0], sp)
-            output = h + ffn_out * self.ffn_out_scale
-            return output
+        # fully connected
+        _ffn_in = self.feed_forward_norm(h)
+        ffn_out = self._forward_ffn(_ffn_in, positions.shape[0], sp)
+        output = h + ffn_out * self.ffn_out_scale
+        return output
 
 
 @support_torch_compile
@@ -903,33 +855,8 @@ class IQuestQ1Model(nn.Module):
             # Keep the residual stream token-sharded through the decoder stack.
             hidden_states = sp_shard(hidden_states)
 
-        layers = list(islice(self.layers, self.start_layer, self.end_layer))
-        for idx, layer in enumerate(layers):
-            if _FUSE_NORM_CHAIN and getattr(layer, "supports_fused_norm", False):
-                prev_fused = (
-                    idx > 0
-                    and getattr(layers[idx - 1], "supports_fused_norm", False)
-                    and not getattr(layers[idx - 1], "use_sandwich_norm", False)
-                )
-                nxt = (
-                    layers[idx + 1].attention_norm.weight
-                    if idx + 1 < len(layers)
-                    and not getattr(layers[idx + 1], "use_sandwich_norm", False)
-                    else None
-                )
-                hidden_states = layer(
-                    positions,
-                    hidden_states,
-                    pre_normed=prev_fused,
-                    next_norm_weight=nxt,
-                    sp_active=sp_active,
-                )
-            else:
-                hidden_states = layer(
-                    positions,
-                    hidden_states,
-                    sp_active=sp_active,
-                )
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            hidden_states = layer(positions, hidden_states, sp_active=sp_active)
 
         if not get_pp_group().is_last_rank:
             if sp_active:
