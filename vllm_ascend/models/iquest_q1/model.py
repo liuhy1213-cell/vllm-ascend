@@ -28,12 +28,17 @@ ACL graph mode is supported for decode (``cudagraph_mode`` FULL / FULL_DECODE_ON
 prefill runs eagerly.
 """
 
+import os as _os
 from collections.abc import Iterable
 from itertools import islice
 
 import torch
 import torch_npu
 from torch import nn
+
+# Phase-1 eager norm-chain fusion. P nodes run --enforce-eager, so the
+# Inductor AddRMSNorm/norm-quant passes never fire there. Default off.
+_FUSE_NORM_CHAIN = _os.getenv("IQUEST_FUSE_NORM", "1") == "1"
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -595,6 +600,7 @@ class IQuestQ1DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         self.use_sandwich_norm = self.layer_idx == 0
+        self.supports_fused_norm = True
 
         mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
         if self.layer_idx not in mlp_only_layers:
@@ -641,6 +647,8 @@ class IQuestQ1DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        pre_normed: bool = False,
+        next_norm_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self Attention
         if self.use_sandwich_norm:
@@ -655,6 +663,31 @@ class IQuestQ1DecoderLayer(nn.Module):
             output = h + self.ffn_out_norm(hidden_states) * self.ffn_out_scale
             return output
         else:
+            if _FUSE_NORM_CHAIN:
+                x = hidden_states if pre_normed else self.attention_norm(hidden_states)
+                attn_output = self.self_attn(positions=positions, hidden_states=x)
+                branch = self.attn_out_norm(attn_output)
+                if self.attn_out_scale != 1.0:
+                    branch = branch * self.attn_out_scale
+                # h = x + branch and ffn_in = RMSNorm(h) in one kernel.
+                ffn_in, _, h = torch_npu.npu_add_rms_norm(
+                    x,
+                    branch,
+                    self.feed_forward_norm.weight,
+                    self.feed_forward_norm.variance_epsilon,
+                )
+                ffn_out = self.mlp(ffn_in) * self.ffn_out_scale
+                if next_norm_weight is not None:
+                    # Fold the next layer's attention_norm into this residual
+                    # add; only the normalized value is needed downstream.
+                    return torch_npu.npu_add_rms_norm(
+                        h,
+                        ffn_out,
+                        next_norm_weight,
+                        self.feed_forward_norm.variance_epsilon,
+                    )[0]
+                return h + ffn_out
+
             x = self.attention_norm(hidden_states)
             attn_output = self.self_attn(positions=positions, hidden_states=x)
             h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
@@ -735,11 +768,31 @@ class IQuestQ1Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(
-                positions,
-                hidden_states,
-            )
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        for idx, layer in enumerate(layers):
+            if _FUSE_NORM_CHAIN and getattr(layer, "supports_fused_norm", False):
+                prev_fused = (
+                    idx > 0
+                    and getattr(layers[idx - 1], "supports_fused_norm", False)
+                    and not getattr(layers[idx - 1], "use_sandwich_norm", False)
+                )
+                nxt = (
+                    layers[idx + 1].attention_norm.weight
+                    if idx + 1 < len(layers)
+                    and not getattr(layers[idx + 1], "use_sandwich_norm", False)
+                    else None
+                )
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    pre_normed=prev_fused,
+                    next_norm_weight=nxt,
+                )
+            else:
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
