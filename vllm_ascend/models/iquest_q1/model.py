@@ -92,6 +92,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -101,6 +102,7 @@ from vllm_ascend.ascend_forward_context import MoECommType, _EXTRA_CTX, use_cann
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
+    sp_reduce_scatter,
     sp_shard,
 )
 from vllm_ascend.ops.fused_moe.routed_experts import moe_input_is_sharded
@@ -398,8 +400,12 @@ class IQuestQ1Attention(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         # The MTP draft runs on full tokens (its recursive block is not
         # sequence-parallel), so keep its attention on the all-reduce path.
+        # Layer 0 is dense and stays on the baseline full-token path; later
+        # layers keep only their token shard after the o_proj TP reduction.
         self.use_sequence_parallel = (
-            _use_sequence_parallel(vllm_config) and not is_mtp_layer
+            _use_sequence_parallel(vllm_config)
+            and not is_mtp_layer
+            and extract_layer_index(prefix) != 0
         )
         self.q_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
@@ -407,6 +413,7 @@ class IQuestQ1Attention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not self.use_sequence_parallel,
             prefix=f"{prefix}.o_proj",
         )
         # [L3 perf] Optional fused o_proj GEMM + TP AllReduce (npu_mm_all_reduce_base),
@@ -567,6 +574,20 @@ class IQuestQ1Attention(nn.Module):
         loaded_weight = loaded_weight[weight_shard_start:weight_shard_end]
         default_weight_loader(param, loaded_weight)
 
+    def _reduce_o_proj_output(
+        self,
+        output: torch.Tensor,
+        sp_active: bool | None,
+    ) -> torch.Tensor:
+        sp = self.use_sequence_parallel and (sp_active is None or sp_active)
+        if sp:
+            return sp_reduce_scatter(output)
+        if self.use_sequence_parallel:
+            # Decode, MTP and mixed batches keep the original full-token
+            # AllReduce result even though the linear stores TP partials.
+            return tensor_model_parallel_all_reduce(output)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -637,10 +658,7 @@ class IQuestQ1Attention(nn.Module):
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-        sp = self.use_sequence_parallel and (sp_active is None or sp_active)
-        # Shard only after the original TP reduction. A BF16 ReduceScatter
-        # can accumulate in a different order and change end-to-end logits.
-        return sp_shard(output) if sp else output
+        return self._reduce_o_proj_output(output, sp_active)
 
 
 class IQuestQ1DecoderLayer(nn.Module):
@@ -851,12 +869,20 @@ class IQuestQ1Model(nn.Module):
         # Per-forward layout: pure prefill uses the token-sharded SP path,
         # decode/MTP and mixed batches keep the full-token all-reduce path.
         sp_active = self.use_sequence_parallel and _is_prefill_forward()
-        if sp_active:
-            # Keep the residual stream token-sharded through the decoder stack.
-            hidden_states = sp_shard(hidden_states)
-
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(positions, hidden_states, sp_active=sp_active)
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        for index, layer in enumerate(layers):
+            if index == 0 and layer.layer_idx != 0 and sp_active:
+                # A pipeline stage that starts after layer 0 receives the
+                # full-token layout from the previous stage.
+                hidden_states = sp_shard(hidden_states)
+            layer_sp_active = sp_active and layer.layer_idx != 0
+            hidden_states = layer(
+                positions,
+                hidden_states,
+                sp_active=layer_sp_active,
+            )
+            if sp_active and layer.layer_idx == 0:
+                hidden_states = sp_shard(hidden_states)
 
         if not get_pp_group().is_last_rank:
             if sp_active:
