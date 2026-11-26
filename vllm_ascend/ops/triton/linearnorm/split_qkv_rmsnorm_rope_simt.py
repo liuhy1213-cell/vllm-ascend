@@ -259,26 +259,25 @@ def split_qkv_rmsnorm_rope_simt_kernel(
         tl.store(v_gm_ptr + out_idx, values, mask=out_mask)
 
 
-# 每步 cos/sin 缓存开关：1=启用（默认），0=退回每层重算（原行为）
-_ENABLE_ROPE_COS_SIN_STEP_CACHE = os.getenv("IQUEST_ROPE_COS_SIN_CACHE", "1") == "1"
+# 每步 cos/sin 缓存默认关闭：forward context 身份和形状无法区分 draft/verify，
+# 开启 MTP/eagle 时可能复用其他 positions 的 cos/sin，图模式下也不能保证 replay 时重算。
+_ENABLE_ROPE_COS_SIN_STEP_CACHE = os.getenv("IQUEST_ROPE_COS_SIN_CACHE", "0") == "1"
 
 _ROPE_COS_SIN_CACHE: dict = {"ctx_ref": None, "tensor": None}
 
 
-def _rope_cos_sin_for_step(positions, cos_sin_cache, batch_size, rope_dim,
-                           num_vectorcore, device):
-    """每步（每个 forward context）只算一次 cos/sin，同一步内所有层复用。
+def _rope_cos_sin_for_step(positions, cos_sin_cache, batch_size, rope_dim, num_vectorcore, device):
+    """默认每次调用均按当前 positions 重算，避免跨 forward 复用旧值。
 
-    缓存键是 forward context 对象的身份（weakref 比较）。好处：
-      * eager：88 层从 88 次 precompute 降到 1 次；
-      * 图捕获：同一个 context 内只入队一个 precompute 节点，replay 时该节点
-        仍会用当时的 positions 重新计算，因此不存在「烤死旧值」的问题。
+    实验性缓存仅供无投机解码的 eager A/B 使用；其键只有 forward context
+    身份和形状，不能证明 positions 相同，禁止用于 MTP/eagle 或图模式。
     """
     if not _ENABLE_ROPE_COS_SIN_STEP_CACHE:
         ctx = None
     else:
         try:
             from vllm.forward_context import get_forward_context
+
             ctx = get_forward_context()
         except Exception:
             ctx = None
@@ -286,8 +285,13 @@ def _rope_cos_sin_for_step(positions, cos_sin_cache, batch_size, rope_dim,
     cache = _ROPE_COS_SIN_CACHE
     if ctx is not None:
         ref, tensor = cache["ctx_ref"], cache["tensor"]
-        if (ref is not None and ref() is ctx and tensor is not None
-                and tensor.shape[0] == batch_size and tensor.shape[1] == rope_dim):
+        if (
+            ref is not None
+            and ref() is ctx
+            and tensor is not None
+            and tensor.shape[0] == batch_size
+            and tensor.shape[1] == rope_dim
+        ):
             return tensor
 
     out = torch.empty(batch_size, rope_dim, dtype=torch.float32, device=device)
@@ -305,7 +309,6 @@ def _rope_cos_sin_for_step(positions, cos_sin_cache, batch_size, rope_dim,
         cache["ctx_ref"] = weakref.ref(ctx)
         cache["tensor"] = out
     return out
-
 
 
 def split_qkv_rmsnorm_rope_simt_impl(
