@@ -134,7 +134,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
-    sp_all_gather,
     sp_reduce_scatter,
     sp_shard,
 )
@@ -147,6 +146,15 @@ IQUEST_MXFP8_GROUP_SIZES = (1, 1, IQUEST_MXFP8_GROUP_SIZE)
 ACL_DTYPE_BF16 = 15
 ACL_DTYPE_FP8_E8M0 = 293
 IQUEST_QKV_AGMM_COMM_MODE = "aiv_urma"
+# Process-wide entry point of the fused QKV AG+MM, fixed on the first fused
+# call (layer 0 of the first prefill / warmup), which every TP rank reaches in
+# lockstep. Both entries launch a TP collective on different communicators,
+# so re-selecting mid-run per rank could split the group; after the choice is
+# fixed, failures surface instead of being converted into a fallback.
+_AGMM_ENTRY: str | None = None
+# One-shot per-process logging for an unavailable entry point: every attention
+# layer probes both entries at init, so warn once instead of 88 times.
+_AGMM_UNAVAILABLE_WARNED: set[str] = set()
 
 logger = init_logger(__name__)
 
@@ -738,50 +746,106 @@ class IQuestQ1Attention(nn.Module):
         return self._qkv_agmm_hcom
 
     def _init_qkv_agmm_api(self, prefix: str) -> None:
-        """Pick the fused QKV AG+MM entry point.
+        """Pick the preferred fused QKV AG+MM entry point.
 
-        Default is the V3 MC2 op (``cann_ops_transformer``) with
-        ``comm_mode="aiv_urma"``; when that package or its URMA comm resources
-        are unavailable the portable ``torch_npu`` entry with
-        ``comm_mode="ai_cpu"`` is used. If neither exists the original
-        gather + QMM path stays.
+        Both entry points are probed for availability here (imports only, no
+        device work) so the first-call fallback in ``_qkv_agmm_dispatch`` can
+        switch in either direction. The preference comes from
+        ``additional_config.iquest_qkv_agmm_comm_mode``: ``"aiv_urma"`` ->
+        ``cann_ops_transformer.all_gather_quant_matmul`` (URMA comm
+        resources, needs the iquest ops package on the node); ``"ai_cpu"`` ->
+        ``torch_npu.npu_all_gather_quant_mm`` (stock CANN, portable). If
+        neither is available the original gather + QMM path stays.
         """
+        self._qkv_agmm_op = None
+        try:
+            import cann_ops_transformer
+
+            self._qkv_agmm_op = cann_ops_transformer.all_gather_quant_matmul
+        except (ImportError, AttributeError) as exc:
+            if "cann" not in _AGMM_UNAVAILABLE_WARNED:
+                _AGMM_UNAVAILABLE_WARNED.add("cann")
+                logger.warning(
+                    "iquest QKV AG+MM: cann_ops_transformer unavailable: %s", exc
+                )
+        torch_npu_ok = callable(getattr(torch_npu, "npu_all_gather_quant_mm", None))
+        if not torch_npu_ok and "torch_npu" not in _AGMM_UNAVAILABLE_WARNED:
+            _AGMM_UNAVAILABLE_WARNED.add("torch_npu")
+            logger.warning(
+                "iquest QKV AG+MM: torch_npu.npu_all_gather_quant_mm unavailable."
+            )
         preferred = get_ascend_config().iquest_qkv_agmm_comm_mode
         order = ("cann", "torch_npu") if preferred != "ai_cpu" else ("torch_npu", "cann")
         for api in order:
-            if api == "cann":
-                try:
-                    import cann_ops_transformer
-
-                    self._qkv_agmm_op = cann_ops_transformer.all_gather_quant_matmul
-                except (ImportError, AttributeError) as exc:
-                    logger.warning(
-                        "iquest QKV AG+MM: cann_ops_transformer unavailable for %s: %s",
-                        prefix,
-                        exc,
-                    )
-                    continue
+            if api == "cann" and self._qkv_agmm_op is not None:
                 self._qkv_agmm_api = "cann"
                 return
-            if not callable(getattr(torch_npu, "npu_all_gather_quant_mm", None)):
-                logger.warning(
-                    "iquest QKV AG+MM: torch_npu.npu_all_gather_quant_mm "
-                    "unavailable for %s.",
-                    prefix,
-                )
-                continue
-            self._qkv_agmm_api = "torch_npu"
-            return
-        logger.warning(
-            "iquest QKV AG+MM disabled for %s: no usable MC2 entry point.", prefix
-        )
+            if api == "torch_npu" and torch_npu_ok:
+                self._qkv_agmm_api = "torch_npu"
+                return
+        if "none" not in _AGMM_UNAVAILABLE_WARNED:
+            _AGMM_UNAVAILABLE_WARNED.add("none")
+            logger.warning(
+                "iquest QKV AG+MM disabled: no usable MC2 entry point (%s).", prefix
+            )
+
+    def _qkv_agmm_call(
+        self, api: str, quantized_x: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor:
+        weight = self.qkv_proj._mxfp8_agmm_weight_nd_buf
+        weight_scale = self.qkv_proj._mxfp8_agmm_scale_nd_buf
+        if api == "cann":
+            return self._qkv_agmm_op(
+                quantized_x,
+                weight.t(),
+                get_tp_group().device_group,
+                x1_scale=x_scale,
+                x2_scale=weight_scale,
+                group_sizes=list(IQUEST_MXFP8_GROUP_SIZES),
+                x1_scale_dtype=ACL_DTYPE_FP8_E8M0,
+                x2_scale_dtype=ACL_DTYPE_FP8_E8M0,
+                y_dtype=ACL_DTYPE_BF16,
+                comm_mode=IQUEST_QKV_AGMM_COMM_MODE,
+            )[0]
+        hcom, world = self._qkv_agmm_get_comm()
+        return torch_npu.npu_all_gather_quant_mm(
+            quantized_x,
+            weight.t(),
+            hcom,
+            world,
+            x1_scale=x_scale,
+            x2_scale=weight_scale,
+            y_dtype=torch.bfloat16,
+            x1_scale_dtype=torch_npu.float8_e8m0fnu,
+            x2_scale_dtype=torch_npu.float8_e8m0fnu,
+            gather_output=False,
+            comm_mode="ai_cpu",
+        )[0]
 
     def _qkv_agmm_dispatch(
         self, quantized_x: torch.Tensor, x_scale: torch.Tensor
     ) -> torch.Tensor | None:
-        """Run the fused AG+MM, switching entry points once on failure."""
-        weight = self.qkv_proj._mxfp8_agmm_weight_nd_buf
-        weight_scale = self.qkv_proj._mxfp8_agmm_scale_nd_buf
+        """Run the fused AG+MM with a one-shot, group-uniform entry choice.
+
+        The entry point is fixed on the first fused call of the process --
+        layer 0 of the first prefill, which all TP ranks execute in lockstep.
+        A first-call error (missing import, unsupported ``comm_mode``, absent
+        URMA resources) switches to the other entry for every later call.
+        Once fixed nothing is caught: both entries launch a TP collective on
+        different communicators, so a per-rank mid-run switch could split the
+        group, and a genuine fault must abort rather than silently diverge.
+        """
+        global _AGMM_ENTRY
+        # Graph capture only records the collective; an entry "fixed" during
+        # capture could still fail at replay. Leave the choice to the eager
+        # path (prefill is eager) and keep capture side-effect free.
+        compiling = torch.compiler.is_compiling()
+        if _AGMM_ENTRY == "disabled":
+            if not compiling:
+                self.use_fused_qkv_agmm = False
+            return None
+        if _AGMM_ENTRY is not None:
+            return self._qkv_agmm_call(_AGMM_ENTRY, quantized_x, x_scale)
         order = (
             ("cann", "torch_npu")
             if self._qkv_agmm_api == "cann"
@@ -789,55 +853,34 @@ class IQuestQ1Attention(nn.Module):
         )
         last_exc = None
         for api in order:
+            if api == "cann" and self._qkv_agmm_op is None:
+                continue
+            if api == "torch_npu" and not callable(
+                getattr(torch_npu, "npu_all_gather_quant_mm", None)
+            ):
+                continue
             try:
-                if api == "cann":
-                    if self._qkv_agmm_op is None:
-                        continue
-                    out = self._qkv_agmm_op(
-                        quantized_x,
-                        weight.t(),
-                        get_tp_group().device_group,
-                        x1_scale=x_scale,
-                        x2_scale=weight_scale,
-                        group_sizes=list(IQUEST_MXFP8_GROUP_SIZES),
-                        x1_scale_dtype=ACL_DTYPE_FP8_E8M0,
-                        x2_scale_dtype=ACL_DTYPE_FP8_E8M0,
-                        y_dtype=ACL_DTYPE_BF16,
-                        comm_mode=IQUEST_QKV_AGMM_COMM_MODE,
-                    )[0]
-                else:
-                    hcom, world = self._qkv_agmm_get_comm()
-                    out = torch_npu.npu_all_gather_quant_mm(
-                        quantized_x,
-                        weight.t(),
-                        hcom,
-                        world,
-                        x1_scale=x_scale,
-                        x2_scale=weight_scale,
-                        y_dtype=torch.bfloat16,
-                        x1_scale_dtype=torch_npu.float8_e8m0fnu,
-                        x2_scale_dtype=torch_npu.float8_e8m0fnu,
-                        gather_output=False,
-                        comm_mode="ai_cpu",
-                    )[0]
+                out = self._qkv_agmm_call(api, quantized_x, x_scale)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 logger.warning(
-                    "iquest QKV AG+MM %s path failed (%s); trying the fallback.",
+                    "iquest QKV AG+MM first %s call failed (%s); trying the other entry.",
                     api,
                     exc,
                 )
                 continue
-            if self._qkv_agmm_api != api:
-                logger.warning("iquest QKV AG+MM switched to the %s path.", api)
-                self._qkv_agmm_api = api
+            if not compiling:
+                _AGMM_ENTRY = api
+                logger.warning("iquest QKV AG+MM entry fixed on %s.", api)
             return out
+        if not compiling:
+            _AGMM_ENTRY = "disabled"
+            self._qkv_agmm_api = None
+            self.use_fused_qkv_agmm = False
         logger.warning(
-            "iquest QKV AG+MM disabled after runtime failure (%s); using gather + QMM.",
+            "iquest QKV AG+MM disabled after the first call (%s); using gather + QMM.",
             last_exc,
         )
-        self._qkv_agmm_api = None
-        self.use_fused_qkv_agmm = False
         return None
 
     def _fused_qkv_agmm_ready(self) -> bool:
