@@ -134,6 +134,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
+    sp_all_gather,
     sp_reduce_scatter,
     sp_shard,
 )
@@ -414,6 +415,8 @@ class IQuestQ1Attention(nn.Module):
         )
         self.use_fused_qkv_agmm = False
         self._qkv_agmm_op = None
+        self._qkv_agmm_api = None
+        self._qkv_agmm_hcom = None
         if self.use_sequence_parallel and get_ascend_config().enable_iquest_qkv_agmm:
             linear_method = self.qkv_proj.quant_method
             quant_method = getattr(linear_method, "quant_method", linear_method)
@@ -429,17 +432,8 @@ class IQuestQ1Attention(nn.Module):
                     prefix,
                 )
             else:
-                try:
-                    import cann_ops_transformer
-
-                    self._qkv_agmm_op = cann_ops_transformer.all_gather_quant_matmul
-                except (ImportError, AttributeError) as exc:
-                    logger.warning(
-                        "iquest QKV AllGatherQuantMatmul disabled for %s: %s",
-                        prefix,
-                        exc,
-                    )
-                else:
+                self._init_qkv_agmm_api(prefix)
+                if self._qkv_agmm_api is not None:
                     # The ordinary QMM retains its transformed NZ buffers.
                     # MXFP8 post-processing additionally preserves the ND
                     # checkpoint orientation consumed by AG+MM.
@@ -645,21 +639,15 @@ class IQuestQ1Attention(nn.Module):
         quantized_x, x_scale = quant_method._quantize_input(
             self.qkv_proj, hidden_states
         )
-        qkv, _, _ = self._qkv_agmm_op(
-            quantized_x,
-            self.qkv_proj._mxfp8_agmm_weight_nd_buf.t(),
-            get_tp_group().device_group,
-            x1_scale=x_scale,
-            x2_scale=self.qkv_proj._mxfp8_agmm_scale_nd_buf,
-            group_sizes=list(IQUEST_MXFP8_GROUP_SIZES),
-            x1_scale_dtype=ACL_DTYPE_FP8_E8M0,
-            x2_scale_dtype=ACL_DTYPE_FP8_E8M0,
-            y_dtype=ACL_DTYPE_BF16,
-            comm_mode=IQUEST_QKV_AGMM_COMM_MODE,
-        )
-        # SP may pad every rank to an equal local token count. Preserve the
-        # old sp_all_gather(... )[:full_tokens] semantics.
-        return qkv[: positions.shape[0]]
+        qkv = self._qkv_agmm_dispatch(quantized_x, x_scale)
+        if qkv is not None:
+            return qkv[: positions.shape[0]]
+        # Neither fused entry point worked: rebuild the full-token QKV the
+        # same way the sequence-parallel reference path does and keep the
+        # original projection from the next forward on.
+        full_hidden = sp_all_gather(hidden_states)[: positions.shape[0]]
+        qkv, _ = self.qkv_proj(full_hidden)
+        return qkv
 
     def forward(
         self,
@@ -738,10 +726,124 @@ class IQuestQ1Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return self._reduce_o_proj_output(output, sp_active)
 
+    def _qkv_agmm_get_comm(self):
+        """HCCL name and TP size for the torch_npu MC2 entry point."""
+        if self._qkv_agmm_hcom is None:
+            group = get_tp_group()
+            backend = group.device_group._get_backend(torch.device("npu"))
+            self._qkv_agmm_hcom = (
+                backend.get_hccl_comm_name(group.rank_in_group),
+                group.world_size,
+            )
+        return self._qkv_agmm_hcom
+
+    def _init_qkv_agmm_api(self, prefix: str) -> None:
+        """Pick the fused QKV AG+MM entry point.
+
+        Default is the V3 MC2 op (``cann_ops_transformer``) with
+        ``comm_mode="aiv_urma"``; when that package or its URMA comm resources
+        are unavailable the portable ``torch_npu`` entry with
+        ``comm_mode="ai_cpu"`` is used. If neither exists the original
+        gather + QMM path stays.
+        """
+        preferred = get_ascend_config().iquest_qkv_agmm_comm_mode
+        order = ("cann", "torch_npu") if preferred != "ai_cpu" else ("torch_npu", "cann")
+        for api in order:
+            if api == "cann":
+                try:
+                    import cann_ops_transformer
+
+                    self._qkv_agmm_op = cann_ops_transformer.all_gather_quant_matmul
+                except (ImportError, AttributeError) as exc:
+                    logger.warning(
+                        "iquest QKV AG+MM: cann_ops_transformer unavailable for %s: %s",
+                        prefix,
+                        exc,
+                    )
+                    continue
+                self._qkv_agmm_api = "cann"
+                return
+            if not callable(getattr(torch_npu, "npu_all_gather_quant_mm", None)):
+                logger.warning(
+                    "iquest QKV AG+MM: torch_npu.npu_all_gather_quant_mm "
+                    "unavailable for %s.",
+                    prefix,
+                )
+                continue
+            self._qkv_agmm_api = "torch_npu"
+            return
+        logger.warning(
+            "iquest QKV AG+MM disabled for %s: no usable MC2 entry point.", prefix
+        )
+
+    def _qkv_agmm_dispatch(
+        self, quantized_x: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Run the fused AG+MM, switching entry points once on failure."""
+        weight = self.qkv_proj._mxfp8_agmm_weight_nd_buf
+        weight_scale = self.qkv_proj._mxfp8_agmm_scale_nd_buf
+        order = (
+            ("cann", "torch_npu")
+            if self._qkv_agmm_api == "cann"
+            else ("torch_npu", "cann")
+        )
+        last_exc = None
+        for api in order:
+            try:
+                if api == "cann":
+                    if self._qkv_agmm_op is None:
+                        continue
+                    out = self._qkv_agmm_op(
+                        quantized_x,
+                        weight.t(),
+                        get_tp_group().device_group,
+                        x1_scale=x_scale,
+                        x2_scale=weight_scale,
+                        group_sizes=list(IQUEST_MXFP8_GROUP_SIZES),
+                        x1_scale_dtype=ACL_DTYPE_FP8_E8M0,
+                        x2_scale_dtype=ACL_DTYPE_FP8_E8M0,
+                        y_dtype=ACL_DTYPE_BF16,
+                        comm_mode=IQUEST_QKV_AGMM_COMM_MODE,
+                    )[0]
+                else:
+                    hcom, world = self._qkv_agmm_get_comm()
+                    out = torch_npu.npu_all_gather_quant_mm(
+                        quantized_x,
+                        weight.t(),
+                        hcom,
+                        world,
+                        x1_scale=x_scale,
+                        x2_scale=weight_scale,
+                        y_dtype=torch.bfloat16,
+                        x1_scale_dtype=torch_npu.float8_e8m0fnu,
+                        x2_scale_dtype=torch_npu.float8_e8m0fnu,
+                        gather_output=False,
+                        comm_mode="ai_cpu",
+                    )[0]
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "iquest QKV AG+MM %s path failed (%s); trying the fallback.",
+                    api,
+                    exc,
+                )
+                continue
+            if self._qkv_agmm_api != api:
+                logger.warning("iquest QKV AG+MM switched to the %s path.", api)
+                self._qkv_agmm_api = api
+            return out
+        logger.warning(
+            "iquest QKV AG+MM disabled after runtime failure (%s); using gather + QMM.",
+            last_exc,
+        )
+        self._qkv_agmm_api = None
+        self.use_fused_qkv_agmm = False
+        return None
+
     def _fused_qkv_agmm_ready(self) -> bool:
         return (
             self.use_fused_qkv_agmm
-            and self._qkv_agmm_op is not None
+            and self._qkv_agmm_api is not None
             and hasattr(self.qkv_proj, "_mxfp8_agmm_weight_nd_buf")
             and hasattr(self.qkv_proj, "_mxfp8_agmm_scale_nd_buf")
         )

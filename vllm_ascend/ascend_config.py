@@ -622,7 +622,12 @@ class AscendConfig:
     # 1 = quantize each iquest_q1 SP token shard before communication and
     # fuse the quantized AllGather with the MXFP8 QKV matmul. Prefill-only;
     # decode, MTP, layer 0, and unsupported quantization keep the old path.
-    enable_iquest_qkv_agmm: int = 0
+    enable_iquest_qkv_agmm: int = 1
+    # Which API the fused QKV AG+MM uses: "aiv_urma" ->
+    # cann_ops_transformer.all_gather_quant_matmul (URMA comm resources,
+    # needs the iquest ops package on the node); "ai_cpu" ->
+    # torch_npu.npu_all_gather_quant_mm (stock CANN, portable).
+    iquest_qkv_agmm_comm_mode: str = "aiv_urma"
     # 1 = replace the iquest_q1 per-head QK-norm with the Triton strided
     # kernel (ops/triton/iquest_qk_norm.py): reads q/k directly from the
     # fused QKV buffer, skipping the contiguous copies npu_rms_norm forces
