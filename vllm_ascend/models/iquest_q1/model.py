@@ -32,8 +32,6 @@ import os as _os
 from collections.abc import Iterable
 from itertools import islice
 
-import os as _os
-
 import torch
 import torch_npu
 from torch import nn
@@ -94,20 +92,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-
-from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import MoECommType, _EXTRA_CTX, use_cann_megamoe
-from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_reduce_scatter,
-    sp_shard,
-)
-from vllm_ascend.ops.fused_moe.routed_experts import moe_input_is_sharded
-from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
-from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -141,6 +128,24 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_reduce_scatter,
+    sp_shard,
+)
+from vllm_ascend.ops.fused_moe.routed_experts import moe_input_is_sharded
+from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
+from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
+
+IQUEST_MXFP8_GROUP_SIZE = 32
+IQUEST_MXFP8_GROUP_SIZES = (1, 1, IQUEST_MXFP8_GROUP_SIZE)
+ACL_DTYPE_BF16 = 15
+ACL_DTYPE_FP8_E8M0 = 293
+IQUEST_QKV_AGMM_COMM_MODE = "aiv_urma"
 
 logger = init_logger(__name__)
 
@@ -407,6 +412,39 @@ class IQuestQ1Attention(nn.Module):
             and not is_mtp_layer
             and extract_layer_index(prefix) != 0
         )
+        self.use_fused_qkv_agmm = False
+        self._qkv_agmm_op = None
+        if self.use_sequence_parallel and get_ascend_config().enable_iquest_qkv_agmm:
+            linear_method = self.qkv_proj.quant_method
+            quant_method = getattr(linear_method, "quant_method", linear_method)
+            if (
+                quant_method.__class__.__name__
+                != "AscendW8A8MXFP8DynamicLinearMethod"
+                or getattr(quant_method, "group_size", None)
+                != IQUEST_MXFP8_GROUP_SIZE
+            ):
+                logger.warning(
+                    "iquest QKV AllGatherQuantMatmul disabled for %s: "
+                    "W8A8_MXFP8 dynamic linear with group_size=32 is required.",
+                    prefix,
+                )
+            else:
+                try:
+                    import cann_ops_transformer
+
+                    self._qkv_agmm_op = cann_ops_transformer.all_gather_quant_matmul
+                except (ImportError, AttributeError) as exc:
+                    logger.warning(
+                        "iquest QKV AllGatherQuantMatmul disabled for %s: %s",
+                        prefix,
+                        exc,
+                    )
+                else:
+                    # The ordinary QMM retains its transformed NZ buffers.
+                    # MXFP8 post-processing additionally preserves the ND
+                    # checkpoint orientation consumed by AG+MM.
+                    self.qkv_proj._keep_mxfp8_agmm_nd = True
+                    self.use_fused_qkv_agmm = True
         self.q_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -588,13 +626,53 @@ class IQuestQ1Attention(nn.Module):
             return tensor_model_parallel_all_reduce(output)
         return output
 
+    def _project_qkv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_is_sharded: bool,
+    ) -> torch.Tensor:
+        if not input_is_sharded:
+            qkv, _ = self.qkv_proj(hidden_states)
+            return qkv
+        if not self._fused_qkv_agmm_ready():
+            raise RuntimeError(
+                "Sharded iquest QKV input requires initialized MXFP8 "
+                "AllGatherQuantMatmul ND buffers."
+            )
+        linear_method = self.qkv_proj.quant_method
+        quant_method = getattr(linear_method, "quant_method", linear_method)
+        quantized_x, x_scale = quant_method._quantize_input(
+            self.qkv_proj, hidden_states
+        )
+        qkv, _, _ = self._qkv_agmm_op(
+            quantized_x,
+            self.qkv_proj._mxfp8_agmm_weight_nd_buf.t(),
+            get_tp_group().device_group,
+            x1_scale=x_scale,
+            x2_scale=self.qkv_proj._mxfp8_agmm_scale_nd_buf,
+            group_sizes=list(IQUEST_MXFP8_GROUP_SIZES),
+            x1_scale_dtype=ACL_DTYPE_FP8_E8M0,
+            x2_scale_dtype=ACL_DTYPE_FP8_E8M0,
+            y_dtype=ACL_DTYPE_BF16,
+            comm_mode=IQUEST_QKV_AGMM_COMM_MODE,
+        )
+        # SP may pad every rank to an equal local token count. Preserve the
+        # old sp_all_gather(... )[:full_tokens] semantics.
+        return qkv[: positions.shape[0]]
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         sp_active: bool | None = None,
+        qkv_input_is_sharded: bool = False,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self._project_qkv(
+            positions,
+            hidden_states,
+            input_is_sharded=qkv_input_is_sharded,
+        )
         if self.use_split_qkv_rmsnorm_rope:
             # One kernel: split [q|k|v], per-head RMSNorm on q/k, NeoX RoPE.
             # The reference path below materializes contiguous q/k views for
@@ -659,6 +737,14 @@ class IQuestQ1Attention(nn.Module):
             attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return self._reduce_o_proj_output(output, sp_active)
+
+    def _fused_qkv_agmm_ready(self) -> bool:
+        return (
+            self.use_fused_qkv_agmm
+            and self._qkv_agmm_op is not None
+            and hasattr(self.qkv_proj, "_mxfp8_agmm_weight_nd_buf")
+            and hasattr(self.qkv_proj, "_mxfp8_agmm_scale_nd_buf")
+        )
 
 
 class IQuestQ1DecoderLayer(nn.Module):
@@ -761,13 +847,17 @@ class IQuestQ1DecoderLayer(nn.Module):
         # Self Attention
         if self.use_sandwich_norm:
             norm_hidden_states = self.attention_norm(hidden_states)
+            fused_qkv_agmm = sp and self.self_attn._fused_qkv_agmm_ready()
             attn_input = (
                 sp_all_gather(norm_hidden_states)[: positions.shape[0]]
-                if sp
+                if sp and not fused_qkv_agmm
                 else norm_hidden_states
             )
             attn_output = self.self_attn(
-                positions=positions, hidden_states=attn_input, sp_active=sp
+                positions=positions,
+                hidden_states=attn_input,
+                sp_active=sp,
+                qkv_input_is_sharded=fused_qkv_agmm,
             )
             h = hidden_states + self.attn_out_norm(attn_output) * self.attn_out_scale
 
@@ -777,13 +867,17 @@ class IQuestQ1DecoderLayer(nn.Module):
             output = h + self.ffn_out_norm(hidden_states) * self.ffn_out_scale
             return output
         x = self.attention_norm(hidden_states)
+        fused_qkv_agmm = sp and self.self_attn._fused_qkv_agmm_ready()
         attn_input = (
             sp_all_gather(x)[: positions.shape[0]]
-            if sp
+            if sp and not fused_qkv_agmm
             else x
         )
         attn_output = self.self_attn(
-            positions=positions, hidden_states=attn_input, sp_active=sp
+            positions=positions,
+            hidden_states=attn_input,
+            sp_active=sp,
+            qkv_input_is_sharded=fused_qkv_agmm,
         )
         h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
 

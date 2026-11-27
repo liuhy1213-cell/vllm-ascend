@@ -273,6 +273,25 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             reshaped_scale = reshaped_scale.reshape(n_dim, k_dim // 2 + 1, 2)
         else:
             reshaped_scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+
+        # AllGatherQuantMatmul consumes the checkpoint orientation as an ND
+        # [N, K] tensor (passed as its transposed view) together with
+        # [N, ceil(K / 64), 2] E8M0 scales. Keep these buffers only for layers
+        # that explicitly opt in. The ordinary QMM buffers below retain their
+        # existing KN/NZ layout, so decode and every fallback path are
+        # unchanged. Reuse the original checkpoint allocations on the first
+        # load and update them in-place on RL reloads to keep graph addresses
+        # stable.
+        if getattr(layer, "_keep_mxfp8_agmm_nd", False):
+            agmm_weight = padded_weight.contiguous()
+            agmm_scale = reshaped_scale.contiguous()
+            if not hasattr(layer, "_mxfp8_agmm_weight_nd_buf"):
+                layer._mxfp8_agmm_weight_nd_buf = agmm_weight
+                layer._mxfp8_agmm_scale_nd_buf = agmm_scale
+            else:
+                layer._mxfp8_agmm_weight_nd_buf.copy_(agmm_weight)
+                layer._mxfp8_agmm_scale_nd_buf.copy_(agmm_scale)
+
         target_scale = reshaped_scale.transpose(0, 1)
 
         transposed_weight = padded_weight.transpose(0, 1).contiguous()

@@ -75,6 +75,51 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertTrue(layer.weight.data.is_contiguous())
         self.assertTrue(layer.weight_scale.data.is_contiguous())
 
+    def test_process_weights_keeps_stable_nd_buffers_for_agmm(self):
+        layer = nn.Module()
+        original_weight = torch.randn(128, 256).to(torch.float8_e4m3fn)
+        original_scale = torch.randint(0, 255, (128, 8), dtype=torch.uint8)
+        layer.weight = nn.Parameter(original_weight.clone(), requires_grad=False)
+        layer.weight_scale = nn.Parameter(original_scale.clone(), requires_grad=False)
+        layer._keep_mxfp8_agmm_nd = True
+
+        self.scheme.process_weights_after_loading(layer)
+
+        self.assertEqual(layer._mxfp8_agmm_weight_nd_buf.shape, (128, 256))
+        self.assertEqual(layer._mxfp8_agmm_scale_nd_buf.shape, (128, 4, 2))
+        torch.testing.assert_close(
+            layer._mxfp8_agmm_weight_nd_buf.float(),
+            original_weight.float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            layer._mxfp8_agmm_scale_nd_buf,
+            original_scale.reshape(128, 4, 2),
+        )
+        weight_ptr = layer._mxfp8_agmm_weight_nd_buf.data_ptr()
+        scale_ptr = layer._mxfp8_agmm_scale_nd_buf.data_ptr()
+
+        self.scheme.restore_weights_for_rl_loading(layer)
+        new_weight = torch.randn(128, 256).to(torch.float8_e4m3fn)
+        new_scale = torch.randint(0, 255, (128, 8), dtype=torch.uint8)
+        layer.weight.data.copy_(new_weight)
+        layer.weight_scale.data.copy_(new_scale)
+        self.scheme.process_weights_after_loading(layer)
+
+        self.assertEqual(layer._mxfp8_agmm_weight_nd_buf.data_ptr(), weight_ptr)
+        self.assertEqual(layer._mxfp8_agmm_scale_nd_buf.data_ptr(), scale_ptr)
+        torch.testing.assert_close(
+            layer._mxfp8_agmm_weight_nd_buf.float(),
+            new_weight.float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            layer._mxfp8_agmm_scale_nd_buf,
+            new_scale.reshape(128, 4, 2),
+        )
+
     def test_restore_after_process_returns_original_shape(self):
         layer = nn.Module()
         layer.weight = nn.Parameter(torch.randn(128, 256).to(torch.float8_e4m3fn), requires_grad=False)
