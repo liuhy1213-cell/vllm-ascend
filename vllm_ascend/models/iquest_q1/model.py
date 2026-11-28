@@ -986,6 +986,8 @@ class IQuestQ1DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        pre_normed: bool = False,
+        next_norm_weight: torch.Tensor | None = None,
         sp_active: bool | None = None,
     ) -> torch.Tensor:
         sp = self.use_sequence_parallel if sp_active is None else sp_active
@@ -1011,7 +1013,16 @@ class IQuestQ1DecoderLayer(nn.Module):
             hidden_states = self._forward_ffn(_ffn_in, positions.shape[0], sp)
             output = h + self.ffn_out_norm(hidden_states) * self.ffn_out_scale
             return output
-        x = self.attention_norm(hidden_states)
+        # Eager norm-chain fusion: P runs --enforce-eager, so the Inductor
+        # AddRMSNorm / norm+quant passes never fire there. Fold the residual
+        # add and the following RMSNorm into one npu_add_rms_norm, and carry
+        # the pre-normalized value across the layer boundary so this layer's
+        # final residual add produces the next layer's attention_norm input
+        # (n kernels for the whole stack instead of 2n). The only numerical
+        # difference is the one the graph-mode pass already introduces: the
+        # add is accumulated in fp32 inside the kernel instead of being
+        # rounded to bf16 before the norm.
+        x = hidden_states if pre_normed else self.attention_norm(hidden_states)
         fused_qkv_agmm = sp and self.self_attn._fused_qkv_agmm_ready()
         attn_input = (
             sp_all_gather(x)[: positions.shape[0]]
@@ -1024,13 +1035,31 @@ class IQuestQ1DecoderLayer(nn.Module):
             sp_active=sp,
             qkv_input_is_sharded=fused_qkv_agmm,
         )
-        h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
+        branch = self.attn_out_norm(attn_output)
+        if self.attn_out_scale != 1.0:
+            branch = branch * self.attn_out_scale
+        # h = x + branch and ffn_in = RMSNorm(h), one kernel.
+        ffn_in, _, h = torch_npu.npu_add_rms_norm(
+            x,
+            branch,
+            self.feed_forward_norm.weight,
+            self.feed_forward_norm.variance_epsilon,
+        )
 
         # fully connected
-        _ffn_in = self.feed_forward_norm(h)
-        ffn_out = self._forward_ffn(_ffn_in, positions.shape[0], sp)
-        output = h + ffn_out * self.ffn_out_scale
-        return output
+        ffn_out = self._forward_ffn(ffn_in, positions.shape[0], sp)
+        if self.ffn_out_scale != 1.0:
+            ffn_out = ffn_out * self.ffn_out_scale
+        if next_norm_weight is not None:
+            # Only the normalized residual leaves this layer; the driver marks
+            # the next layer pre_normed.
+            return torch_npu.npu_add_rms_norm(
+                h,
+                ffn_out,
+                next_norm_weight,
+                self.feed_forward_norm.variance_epsilon,
+            )[0]
+        return h + ffn_out
 
 
 @support_torch_compile
@@ -1115,11 +1144,30 @@ class IQuestQ1Model(nn.Module):
                 # full-token layout from the previous stage.
                 hidden_states = sp_shard(hidden_states)
             layer_sp_active = sp_active and layer.layer_idx != 0
-            hidden_states = layer(
-                positions,
-                hidden_states,
-                sp_active=layer_sp_active,
-            )
+            if layer.use_sandwich_norm:
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    sp_active=layer_sp_active,
+                )
+            else:
+                # The previous non-sandwich layer already piped its final
+                # residual through this layer's attention_norm weight; only
+                # the last layer of the stage leaves the residual unnormalized.
+                pre_normed = index > 0 and not layers[index - 1].use_sandwich_norm
+                next_norm_weight = (
+                    layers[index + 1].attention_norm.weight
+                    if index + 1 < len(layers)
+                    and not layers[index + 1].use_sandwich_norm
+                    else None
+                )
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    pre_normed=pre_normed,
+                    next_norm_weight=next_norm_weight,
+                    sp_active=layer_sp_active,
+                )
             if sp_active and layer.layer_idx == 0:
                 hidden_states = sp_shard(hidden_states)
 
